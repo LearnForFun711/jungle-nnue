@@ -97,14 +97,20 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 shards = sorted(glob.glob(os.path.join(DATA_DIR, "data.t*.bin")))
 archives = sorted(glob.glob(os.path.join(DATA_DIR, "*.tar.gz"))) + \\
+           sorted(glob.glob(os.path.join(DATA_DIR, "*.tgz"))) + \\
            sorted(glob.glob("/content/*.tar.gz")) + \\
-           sorted(glob.glob("/content/*.tgz"))
+           sorted(glob.glob("/content/*.tgz")) + \\
+           sorted(glob.glob("*.tar.gz")) + \\
+           sorted(glob.glob("*.tgz"))
 
 if not shards and archives:
     for a in archives:
         print("unpacking", a)
         with tarfile.open(a) as tar:
-            tar.extractall(DATA_DIR)
+            try:
+                tar.extractall(DATA_DIR, filter="data")
+            except TypeError:
+                tar.extractall(DATA_DIR)
     shards = sorted(glob.glob(os.path.join(DATA_DIR, "data.t*.bin")))
 
 print("shards found:", len(shards))
@@ -113,7 +119,10 @@ print("total: %.1f MB  (~%.0fk positions)" % (total / 1e6, total / 68 / 1000))
 for s in shards[:5]:
     print("  ", s, "%.1f MB" % (os.path.getsize(s) / 1e6))
 if not shards:
-    raise SystemExit("No dataset found.  Upload jungle-dataset.tar.gz into data/ first.")
+    raise SystemExit(
+        "No dataset found.\n"
+        "Upload jungle-dataset.tar.gz with the file pane (folder icon) into the "
+        "'data' folder, or into the runtime root, then run this cell again.")
 """),
     md("""
 ### Or upload it right here
@@ -140,7 +149,7 @@ fits, which makes the feature construction essentially free.
 
 | flag | meaning |
 |---|---|
-| `--epochs` | passes over the data |
+| `--epochs` | passes over the data (40 is cheap: the whole run takes under a minute on an A100) |
 | `--batch` | positions per step (8192 is a good default on an A100) |
 | `--lr` | peak learning rate |
 | `--ft-hidden` / `--hidden` | network width |
@@ -155,7 +164,7 @@ the data was.
 import os, sys, time
 
 PATTERN = "data/data.t*.bin"
-EPOCHS   = int(os.environ.get("EPOCHS", "15"))
+EPOCHS   = int(os.environ.get("EPOCHS", "40"))
 BATCH    = int(os.environ.get("BATCH", "8192"))
 LR       = float(os.environ.get("LR", "2e-3"))
 FT       = int(os.environ.get("FT_HIDDEN", "256"))
