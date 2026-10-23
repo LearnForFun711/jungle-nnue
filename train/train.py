@@ -77,6 +77,11 @@ def main():
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--resume", default="")
     ap.add_argument("--max-minutes", type=float, default=0.0)
+    ap.add_argument("--budget-minutes", type=float, default=0.0,
+                    help="train for roughly this many minutes; the learning "
+                         "rate schedule is re-aimed at the budget so it decays "
+                         "across the whole run instead of stopping part-way "
+                         "through a shorter schedule")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -104,6 +109,34 @@ def main():
     result_t = torch.from_numpy(result)
     value_t = torch.from_numpy(mcts_value)
     print(f"  train {len(tr_idx)}  val {len(va_idx)}", flush=True)
+
+    # --- gradient self-check ----------------------------------------------
+    #
+    # The straight-through estimator that carries the gradient through the
+    # int8 rounding is easy to break, and a broken one is invisible in the
+    # loss curve: the loss simply plateaus at the variance of the target and
+    # looks like an ordinary "the model is not very good".  Every parameter
+    # has to receive a gradient, so check it before spending an hour on a run
+    # that cannot learn anything.
+    probe = JungleNNUE(args.ft_hidden, args.hidden).to(device)
+    probe.train()
+    idx = tr_idx[: min(512, len(tr_idx))]
+    pb = board_t[idx].to(device).long()
+    ps = stm_t[idx].to(device)
+    py = ((1.0 - args.result_weight) * value_t[idx].to(device)
+          + args.result_weight * result_t[idx].to(device)).float()
+    pfr, pfb = make_features(pb, ps)
+    ploss = torch.nn.functional.mse_loss(probe(pfr, pfb, ps).float(), py)
+    ploss.backward()
+    dead = [name for name, p in probe.named_parameters()
+            if p.grad is None or float(p.grad.abs().max()) == 0.0]
+    if dead:
+        print(f"ERROR: these parameters receive no gradient: {dead}", file=sys.stderr)
+        print("       The straight-through estimator is broken; the network "
+              "cannot learn anything this way.", file=sys.stderr)
+        return 3
+    print("  gradient self-check: all parameters receive a gradient", flush=True)
+    del probe
 
     # The dataset stores both the MCTS value and the game result from the
     # point of view of the side to move, which is exactly what the network
@@ -137,10 +170,52 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  parameters: {n_params/1e6:.2f}M", flush=True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4,
+    # Per-layer learning rates.
+    #
+    # Every layer's weights are quantised to int8 per output row, so the
+    # smallest change that affects the forward pass is one quantisation
+    # step, max|W|/127.  Adam moves every parameter by roughly `lr` per
+    # step no matter how big its gradient is, so a single global learning
+    # rate trains a layer whose weights are large far too slowly and a layer
+    # whose weights are small far too violently.  The weight magnitudes in
+    # this network span five orders of magnitude (the feature transformer
+    # needs large weights because its input is binary, the output layer
+    # needs tiny ones because its output is in [-1,1]), and the quantisation
+    # steps span the same factor -- so the mismatch between the learning
+    # rate and the step spans 40,000x.
+    #
+    # Scaling the learning rate with the layer's weight magnitude makes
+    # lr/step the same for every layer, which is what makes a single
+    # `--lr` meaningful at all.
+    layers = [("ft", model.ft), ("h1", model.h1), ("h2", model.h2), ("out", model.out)]
+
+    def layer_lr(layer):
+        return args.lr * float(layer.weight.detach().abs().max())
+
+    param_groups = []
+    layer_groups = []
+    for name, layer in layers:
+        w_group = {"params": [layer.weight], "lr": layer_lr(layer),
+                   "base_lr": layer_lr(layer), "name": f"{name}.weight"}
+        # The gain is not quantised, so it keeps the plain learning rate.
+        g_group = {"params": [layer.log_gain], "lr": args.lr,
+                   "base_lr": args.lr, "name": f"{name}.gain"}
+        param_groups.append(w_group)
+        param_groups.append(g_group)
+        layer_groups.append((layer, w_group))
+
+    opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=1e-4,
                             betas=(0.9, 0.95))
+    print("  per-layer learning rates: " + "  ".join(
+        f"{g['name']}={g['lr']:.2e}" for g in param_groups), flush=True)
 
     steps_per_epoch = max(1, len(tr_idx) // args.batch)
+    # When a wall-clock budget is given the number of epochs is not known
+    # in advance -- it depends on how fast the machine is.  The cosine
+    # schedule is therefore re-aimed at the budget after every epoch, so the
+    # learning rate decays across the whole budget instead of stopping
+    # part-way through a schedule that was sized for fewer epochs.
+    budget = args.budget_minutes if args.budget_minutes > 0 else args.max_minutes
     total_steps = steps_per_epoch * args.epochs
     warmup = max(1, args.warmup_steps)
 
@@ -159,9 +234,17 @@ def main():
     start = time.time()
     stop = False
 
-    for epoch in range(args.epochs):
+    epoch = 0
+    max_epochs = args.epochs if budget <= 0 else 10 ** 9
+    while epoch < max_epochs:
+        epoch += 1
         model.train()
         running, seen = 0.0, 0
+        # Refresh the per-layer scaling: the weight magnitudes drift during
+        # training, and the learning rate has to follow them to keep the
+        # lr/quantisation-step ratio constant.
+        for layer, w_group in layer_groups:
+            w_group["base_lr"] = layer_lr(layer)
         perm = tr_idx.copy()
         np.random.default_rng(args.seed + epoch).shuffle(perm)
         for i in range(0, len(perm) - args.batch + 1, args.batch):
@@ -178,7 +261,7 @@ def main():
                 y = target_all[ti.to(device)]
 
             for g in opt.param_groups:
-                g["lr"] = lr_at(step)
+                g["lr"] = g["base_lr"] * lr_at(step) / args.lr
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                 fr, fb = make_features(b, s)
@@ -203,7 +286,7 @@ def main():
                       f"{seen/max(el,1e-9):.0f} pos/s elapsed {el/60:.1f}m", flush=True)
                 running, seen = 0.0, 0
 
-            if args.max_minutes and (time.time() - start) / 60 > args.max_minutes:
+            if budget and (time.time() - start) / 60 > budget:
                 print("  time budget reached, stopping", flush=True)
                 stop = True
                 break
@@ -229,6 +312,17 @@ def main():
                 vn += len(idx)
         val = vs / max(1, vn)
         print(f"epoch {epoch}: val_loss {val:.6f}  ({(time.time()-start)/60:.1f} min)", flush=True)
+
+        # Re-aim the cosine schedule at the wall-clock budget.  The number of
+        # epochs that fit in the budget is only known once the machine's
+        # speed is known, and it changes as the data set grows.
+        if args.budget_minutes > 0:
+            elapsed_min = max((time.time() - start) / 60, 1e-9)
+            epochs_fitting = max(1, int(args.budget_minutes / elapsed_min))
+            total_steps = max(warmup + 1, steps_per_epoch * epochs_fitting)
+            if epoch == 1 or epoch % 10 == 0:
+                print(f"    budget {args.budget_minutes:.0f} min -> "
+                      f"{epochs_fitting} epochs scheduled", flush=True)
 
         ckpt = os.path.join(args.out, "last.pt")
         torch.save({"model": model.state_dict(), "ft_hidden": args.ft_hidden,

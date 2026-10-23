@@ -70,10 +70,13 @@ struct NnueNetwork {
 
     std::vector<int8_t>  ft_w;    // [FT_INPUT][ft_hidden]  (transposed)
     std::vector<float>   ft_scale;// [ft_hidden]
+    std::vector<float>   ft_bias; // [ft_hidden]
     std::vector<int8_t>  h_w[2];  // [hidden][in]
     std::vector<float>   h_scale[2];
+    std::vector<float>   h_bias[2];
     std::vector<int8_t>  out_w;   // [2*hidden]
     float                out_scale = 0.f;
+    float                out_bias = 0.f;
 
     // Runtime state
     std::vector<int32_t> acc[2];  // FT accumulators for RED / BLACK perspective
@@ -86,7 +89,7 @@ struct NnueNetwork {
 // ---------------------------------------------------------------------------
 //
 //   char[8]  "JNNUE\0\0\0"
-//   uint32   version = 2
+//   uint32   version = 3
 //   uint32   ft_hidden
 //   uint32   hidden
 //   uint32   num_layers
@@ -94,12 +97,16 @@ struct NnueNetwork {
 //   uint32   num_squares
 //   int8     ft_w    [FT_INPUT][ft_hidden]   (transposed, see below)
 //   float32  ft_scale[ft_hidden]
+//   float32  ft_bias [ft_hidden]
 //   int8     h0_w    [hidden][ft_hidden]
 //   float32  h0_scale[hidden]
+//   float32  h0_bias [hidden]
 //   int8     h1_w    [hidden][hidden]
 //   float32  h1_scale[hidden]
+//   float32  h1_bias [hidden]
 //   int8     out_w   [2*hidden]
 //   float32  out_scale
+//   float32  out_bias
 //
 // All scalars are little-endian.
 //
@@ -132,26 +139,34 @@ inline bool nnue_load(const std::string& path, NnueNetwork& net) {
     if (!read_u32(version) || !read_u32(net.ft_hidden) || !read_u32(net.hidden) ||
         !read_u32(net.num_layers) || !read_u32(buckets) || !read_u32(squares))
         return false;
-    if (version != 2 || buckets != NUM_BUCKETS || squares != NUM_SQ) return false;
+    if (version != 3 || buckets != NUM_BUCKETS || squares != NUM_SQ) return false;
     if (net.num_layers != 2) return false;
 
     net.ft_w.resize(size_t(FT_INPUT) * net.ft_hidden);
     net.ft_scale.resize(net.ft_hidden);
+    net.ft_bias.resize(net.ft_hidden);
     net.h_w[0].resize(size_t(net.hidden) * net.ft_hidden);
     net.h_scale[0].resize(net.hidden);
+    net.h_bias[0].resize(net.hidden);
     net.h_w[1].resize(size_t(net.hidden) * net.hidden);
     net.h_scale[1].resize(net.hidden);
+    net.h_bias[1].resize(net.hidden);
     net.out_w.resize(size_t(2) * net.hidden);
     net.out_scale = 0.f;
+    net.out_bias = 0.f;
 
     if (!read_raw(net.ft_w.data(), net.ft_w.size())) return false;
     if (!read_raw(net.ft_scale.data(), net.ft_scale.size() * 4)) return false;
+    if (!read_raw(net.ft_bias.data(), net.ft_bias.size() * 4)) return false;
     if (!read_raw(net.h_w[0].data(), net.h_w[0].size())) return false;
     if (!read_raw(net.h_scale[0].data(), net.h_scale[0].size() * 4)) return false;
+    if (!read_raw(net.h_bias[0].data(), net.h_bias[0].size() * 4)) return false;
     if (!read_raw(net.h_w[1].data(), net.h_w[1].size())) return false;
     if (!read_raw(net.h_scale[1].data(), net.h_scale[1].size() * 4)) return false;
+    if (!read_raw(net.h_bias[1].data(), net.h_bias[1].size() * 4)) return false;
     if (!read_raw(net.out_w.data(), net.out_w.size())) return false;
     if (!read_raw(&net.out_scale, 4)) return false;
+    if (!read_raw(&net.out_bias, 4)) return false;
 
     net.acc[0].assign(net.ft_hidden, 0);
     net.acc[1].assign(net.ft_hidden, 0);
@@ -162,26 +177,56 @@ inline bool nnue_load(const std::string& path, NnueNetwork& net) {
 // Inference
 // ---------------------------------------------------------------------------
 
-// Dot product of two int8 vectors, accumulated in int32.
+// Dot product of an int8 weight vector with a *non-negative* int8 activation
+// vector, accumulated in int32.
 //
 // The inner loop is the single hottest piece of code in the engine: it runs
 // ~400k times per evaluation, so the difference between a scalar loop and a
 // vectorised one is the difference between the neural engine being able to
 // search as deeply as the handcrafted one and not.
+//
+// Every activation in this network is clipped to [0,127], and every weight is
+// in [-127,127].  That lets us use VPMADDUBSW, which multiplies an *unsigned*
+// byte by a signed byte and adds the two products in int16:
+//
+//     maddubs(x, w)[i] = x[2i]*w[2i] + x[2i+1]*w[2i+1]
+//
+// The result can be as large as 2*127*127 = 32258 in magnitude, which still
+// fits in an int16 (max 32767) -- so the instruction never saturates and the
+// result is exact.  A second VPMADDWD against a vector of ones then folds the
+// int16 pairs into int32.
+//
+// Compared with widening the activations to int16 first (the obvious
+// approach), this halves the number of conversion instructions and processes
+// 64 bytes per iteration instead of 32.
+//
+// Precondition: every element of `x` must be in [0,127].  Violating it
+// silently produces wrong results rather than an error, because maddubs
+// treats its first operand as unsigned.
 inline int32_t dot_i8(const int8_t* w, const int8_t* x, int n) {
     int32_t sum = 0;
     int i = 0;
 #if defined(__AVX2__)
+    const __m256i ones = _mm256_set1_epi16(1);
     __m256i acc = _mm256_setzero_si256();
-    for (; i + 32 <= n; i += 32) {
-        const __m256i wv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i));
+    for (; i + 64 <= n; i += 64) {
+        const __m256i x0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
+        const __m256i x1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i + 32));
+        const __m256i w0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i));
+        const __m256i w1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i + 32));
+        const __m256i t0 = _mm256_maddubs_epi16(x0, w0);   // 16 int16
+        const __m256i t1 = _mm256_maddubs_epi16(x1, w1);
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(t0, ones));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(t1, ones));
+    }
+    if (i + 32 <= n) {
         const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x + i));
-        const __m256i wlo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(wv));
-        const __m256i whi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(wv, 1));
-        const __m256i xlo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(xv));
-        const __m256i xhi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(xv, 1));
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(wlo, xlo));
-        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(whi, xhi));
+        const __m256i wv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + i));
+        const __m256i t = _mm256_maddubs_epi16(xv, wv);
+        const __m256i lo = _mm256_cvtepi16_epi32(_mm256_castsi256_si128(t));
+        const __m256i hi = _mm256_cvtepi16_epi32(_mm256_extracti128_si256(t, 1));
+        acc = _mm256_add_epi32(acc, _mm256_add_epi32(lo, hi));
+        i += 32;
     }
     __m128i lo = _mm256_castsi256_si128(acc);
     __m128i hi = _mm256_extracti128_si256(acc, 1);
@@ -283,19 +328,19 @@ inline float nnue_forward(const NnueNetwork& net, int stm) {
     int8_t h1_red[1024], h1_black[1024];
 
     for (int h = 0; h < FH; ++h) {
-        ft_red[h]   = clip127(fast_round(float(net.acc[RED][h])   * net.ft_scale[h]));
-        ft_black[h] = clip127(fast_round(float(net.acc[BLACK][h]) * net.ft_scale[h]));
+        ft_red[h]   = clip127(fast_round(float(net.acc[RED][h])   * net.ft_scale[h] + net.ft_bias[h]));
+        ft_black[h] = clip127(fast_round(float(net.acc[BLACK][h]) * net.ft_scale[h] + net.ft_bias[h]));
     }
 
     const int8_t* w0 = net.h_w[0].data();
     const int8_t* w1 = net.h_w[1].data();
     for (int o = 0; o < H; ++o) {
-        h0_red[o]   = clip127(fast_round(float(dot_i8(w0 + size_t(o) * FH, ft_red, FH))   * net.h_scale[0][o]));
-        h0_black[o] = clip127(fast_round(float(dot_i8(w0 + size_t(o) * FH, ft_black, FH)) * net.h_scale[0][o]));
+        h0_red[o]   = clip127(fast_round(float(dot_i8(w0 + size_t(o) * FH, ft_red, FH))   * net.h_scale[0][o] + net.h_bias[0][o]));
+        h0_black[o] = clip127(fast_round(float(dot_i8(w0 + size_t(o) * FH, ft_black, FH)) * net.h_scale[0][o] + net.h_bias[0][o]));
     }
     for (int o = 0; o < H; ++o) {
-        h1_red[o]   = clip127(fast_round(float(dot_i8(w1 + size_t(o) * H, h0_red, H))   * net.h_scale[1][o]));
-        h1_black[o] = clip127(fast_round(float(dot_i8(w1 + size_t(o) * H, h0_black, H)) * net.h_scale[1][o]));
+        h1_red[o]   = clip127(fast_round(float(dot_i8(w1 + size_t(o) * H, h0_red, H))   * net.h_scale[1][o] + net.h_bias[1][o]));
+        h1_black[o] = clip127(fast_round(float(dot_i8(w1 + size_t(o) * H, h0_black, H)) * net.h_scale[1][o] + net.h_bias[1][o]));
     }
 
     // The two perspectives are ordered by the side to move, exactly as
@@ -311,7 +356,7 @@ inline float nnue_forward(const NnueNetwork& net, int stm) {
         std::memcpy(joint + H, h1_red, H);
     }
     const int32_t acc = dot_i8(net.out_w.data(), joint, 2 * H);
-    return float(acc) * net.out_scale;
+    return float(acc) * net.out_scale + net.out_bias;
 }
 
 // ---------------------------------------------------------------------------

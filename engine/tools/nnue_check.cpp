@@ -24,6 +24,55 @@
 
 using namespace jungle;
 
+namespace {
+
+// Reference implementation of the dot product, and a check that the
+// vectorised one is bit-exact against it.
+//
+// The vectorised path uses VPMADDUBSW, which saturates its int16 result.  It
+// is only exact because every activation is in [0,127] and every weight is in
+// [-127,127], so the largest possible intermediate is 2*127*127 = 32258,
+// which still fits in an int16.  This test hammers exactly that boundary.
+int dot_reference(const int8_t* w, const int8_t* x, int n) {
+    int32_t sum = 0;
+    for (int i = 0; i < n; ++i) sum += int32_t(w[i]) * int32_t(x[i]);
+    return sum;
+}
+
+bool check_dot() {
+    std::mt19937_64 rng(987654321ULL);
+    std::vector<int8_t> w, x;
+    bool ok = true;
+
+    // Sizes around the 32/64 byte block boundaries the SIMD loop cares about.
+    for (int n : {1, 7, 16, 31, 32, 33, 63, 64, 65, 100, 127, 128, 255, 256, 257, 512}) {
+        w.resize(n);
+        x.resize(n);
+        for (int trial = 0; trial < 40; ++trial) {
+            for (int i = 0; i < n; ++i) {
+                // Mix random values with the extremes that could saturate.
+                if (trial % 4 == 0) {
+                    w[i] = int8_t((rng() % 2) ? 127 : -127);
+                    x[i] = int8_t((rng() % 2) ? 127 : 0);
+                } else {
+                    w[i] = int8_t(int(rng() % 255) - 127);
+                    x[i] = int8_t(int(rng() % 128));
+                }
+            }
+            const int a = dot_reference(w.data(), x.data(), n);
+            const int b = dot_i8(w.data(), x.data(), n);
+            if (a != b) {
+                std::fprintf(stderr, "FAIL: dot_i8 mismatch at n=%d: %d != %d\n", n, b, a);
+                ok = false;
+                return ok;
+            }
+        }
+    }
+    return ok;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: nnue_check <net.nnue> [games] [plies]\n");
@@ -37,6 +86,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot load %s\n", argv[1]);
         return 1;
     }
+
+    std::printf("dot product exactness: %s\n", check_dot() ? "PASS" : "FAIL");
+    if (!check_dot()) return 1;
 
     std::mt19937_64 rng(20241023ULL);
     double worst_value = 0.0;

@@ -39,6 +39,7 @@ struct MctsParams {
     int    leaf_agg        = 1;     // 0 = max over children, 1 = mean over children
     int    max_ply         = 200;   // draw by length
     bool   use_nnue        = false;
+    double leaf_scale      = 1.0;  // scales the neural leaf evaluation
 };
 
 enum NodeStatus : int8_t { ST_ONGOING = 0, ST_WIN = 1, ST_LOSS = -1, ST_DRAW = 2 };
@@ -176,7 +177,7 @@ private:
     // static evaluation, which is what the network has to learn from.
     double leaf_value(const Position& pos) {
         if (p_.use_nnue && ev_ && ev_->uses_nnue()) {
-            const float v = float(ev_->eval(pos)) / 1000.0f;
+            const float v = float(ev_->eval(pos)) / 1000.0f * float(p_.leaf_scale);
             return double(std::max(-1.0f, std::min(1.0f, v)));
         }
         if (p_.rollouts > 0) {

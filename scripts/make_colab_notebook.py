@@ -152,66 +152,117 @@ If you prefer not to use the file pane, the cell below opens a file chooser.
 # print("shards:", len(shards))
 """),
     md("""
-## 4. Train
+## 4. Start the data generator in the background
 
-`--data` is a glob.  The trainer keeps the whole dataset on the GPU when it
-fits, which makes the feature construction essentially free.
+The GPU is not the bottleneck -- generating the teacher's data is.  Colab gives
+a couple of CPU cores, so this is much slower than a laptop, but it runs
+*while* the GPU trains, and the trainer picks the new shards up as they
+appear.
+
+This cell starts it in the background and returns immediately.  Stop it with
+the `pkill` line in the last cell.
+"""),
+    code("""
+import os, subprocess, sys, time
+
+SELFPLAY_MINUTES = int(os.environ.get("SELFPLAY_MINUTES", "480"))
+os.makedirs("data/more", exist_ok=True)
+
+# --nnue is deliberately not used here: at this point there is no trained
+# network yet, so the teacher still uses the handcrafted leaf.  Once the
+# first network exists, the cell at the end of this notebook restarts the
+# generator with the network as the teacher's leaf -- that is the expert
+# iteration loop, and it is what makes the teacher's data improve from one
+# round to the next.
+proc = subprocess.Popen(
+    ["bash", "scripts/selfplay_loop.sh", str(SELFPLAY_MINUTES),
+     "data/more/data", str(os.cpu_count() or 2)],
+    stdout=open("selfplay.log", "w"), stderr=subprocess.STDOUT)
+print("self-play started in the background (pid %d), log: selfplay.log" % proc.pid)
+time.sleep(5)
+print(open("selfplay.log").read()[-800:])
+"""),
+    md("""
+## 5. Train -- eight hours of it
+
+The whole training budget is one number.  `train/train_budget.py` splits it
+across several network shapes; each run gets a slice, trains on whatever data
+is on disk at that moment (so the shards the background generator is writing
+get picked up), and exports its network.
 
 | flag | meaning |
 |---|---|
-| `--epochs` | passes over the data (40 is cheap: the whole run takes under a minute on an A100) |
+| `--minutes` | the total wall-clock budget |
+| `--configs` | comma separated `ft_hidden:hidden:result_weight` |
 | `--batch` | positions per step (8192 is a good default on an A100) |
 | `--lr` | peak learning rate |
-| `--ft-hidden` / `--hidden` | network width |
-| `--result-weight` | how much of the target comes from the game result vs. the MCTS value |
-| `--max-minutes` | wall-clock budget; training stops cleanly when it is hit |
 
-The network is only ~300k parameters, so an A100 runs through a million
-positions in well under a second.  Training is not the bottleneck — generating
-the data was.
+The learning-rate schedule is re-aimed at the budget after every epoch, so
+the rate decays across the whole eight hours instead of stopping part-way
+through a schedule sized for fewer epochs.
+
+Note that the network with the lowest validation loss is not automatically
+the strongest one: a wider network evaluates more accurately but also more
+slowly, and at a fixed clock the slower engine searches less deeply.  Every
+candidate is exported so they can be compared by playing strength.
 """),
     code("""
 import os, sys, time
 
-PATTERN = "data/data.t*.bin"
-EPOCHS   = int(os.environ.get("EPOCHS", "40"))
-BATCH    = int(os.environ.get("BATCH", "8192"))
-LR       = float(os.environ.get("LR", "2e-3"))
-FT       = int(os.environ.get("FT_HIDDEN", "256"))
-HIDDEN   = int(os.environ.get("HIDDEN", "128"))
-MAXMIN   = float(os.environ.get("MAX_MINUTES", "0"))
-RESULTW  = float(os.environ.get("RESULT_WEIGHT", "0.25"))
+BUDGET_MINUTES = int(os.environ.get("BUDGET_MINUTES", "480"))   # eight hours
+CONFIGS        = os.environ.get("CONFIGS", "256:128:0.25,384:192:0.25")
+BATCH          = int(os.environ.get("BATCH", "8192"))
+LR             = float(os.environ.get("LR", "2e-3"))
 
-print(f"epochs={EPOCHS} batch={BATCH} lr={LR} ft={FT} hidden={HIDDEN} result_weight={RESULTW}")
+print(f"budget={BUDGET_MINUTES} min  configs={CONFIGS}  batch={BATCH}  lr={LR}")
 t0 = time.time()
-!{sys.executable} train/train.py --data "{PATTERN}" --out runs/colab \\
-    --epochs {EPOCHS} --batch {BATCH} --lr {LR} --ft-hidden {FT} --hidden {HIDDEN} \\
-    --result-weight {RESULTW} --max-minutes {MAXMIN}
+!{sys.executable} train/train_budget.py --data "data/data.t*.bin" \\
+    --out runs/budget --minutes {BUDGET_MINUTES} --configs "{CONFIGS}" \\
+    --batch {BATCH} --lr {LR} --best-out /content/net.nnue
 print("training took %.1f minutes" % ((time.time() - t0) / 60))
 """),
     md("""
-## 5. Export
+## 6. Export
 
-The exported file holds the int8 weights, the per-layer scales and the
-architecture metadata.  The C++ engine reads it directly.
+The exported file holds the int8 weights, the per-layer scales and biases,
+and the architecture metadata.  The C++ engine reads it directly.
 """),
     code("""
-!python3 train/export_nnue.py --checkpoint runs/colab/best.pt --out /content/net.nnue
-import os
-print("net.nnue: %.2f MB" % (os.path.getsize("/content/net.nnue") / 1e6))
+import glob, os, shutil
+
+# Every candidate, plus the best one by validation loss.
+os.makedirs("/content/candidates", exist_ok=True)
+for net in sorted(glob.glob("runs/budget/*/net.nnue")):
+    shutil.copyfile(net, os.path.join("/content/candidates", os.path.basename(os.path.dirname(net)) + ".nnue"))
+    print("candidate:", net)
+
+for net in sorted(glob.glob("runs/budget/*/net.nnue")):
+    ck = net.replace("/net.nnue", "/best.pt")
+    if os.path.exists(ck):
+        out = "/content/candidates/" + os.path.basename(os.path.dirname(net)) + ".nnue"
+        subprocess_ok = os.system(f"python3 train/export_nnue.py --checkpoint {ck} --out {out}") == 0
+        print("re-exported", out, "ok" if subprocess_ok else "FAILED")
+
+print()
+print("best net:", "/content/net.nnue",
+      "%.2f MB" % (os.path.getsize("/content/net.nnue") / 1e6) if os.path.exists("/content/net.nnue") else "MISSING")
 """),
     md("""
-## 6. Verify
+## 7. Verify
 
 This proves that the PyTorch forward pass and the C++ inference produce
 identical values, so the engine plays exactly the network that was trained.
 It should print `PASS`.
 """),
     code("""
-!python3 scripts/verify_nnue.py --checkpoint runs/colab/best.pt --net build/verify.nnue --positions 300
+import glob, os
+for ck in sorted(glob.glob("runs/budget/*/best.pt")):
+    print("==", ck)
+    os.system(f"python3 scripts/verify_nnue.py --checkpoint {ck} --net build/verify.nnue --positions 200")
+    os.system(f"./engine/build/nnue_check /content/net.nnue 5 60")
 """),
     md("""
-## 7. Download the network
+## 8. Download the network
 
 `net.nnue` is about 300 KB.  Put it in the project's `net.nnue` and you can
 run the match locally:
@@ -222,24 +273,52 @@ cd engine
 ```
 """),
     code("""
+import shutil, zipfile, os, glob
 from google.colab import files
+
+# The best network ...
 files.download("/content/net.nnue")
+
+# ... every candidate, in one archive, so the strongest one can be chosen by
+# playing strength rather than by validation loss.
+zip_path = "/content/candidates.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for f in glob.glob("/content/candidates/*.nnue"):
+        z.write(f, os.path.basename(f))
+files.download(zip_path)
 """),
     md("""
-## 8. (Optional) More self-play data on the VM
+## 9. (Optional) Take the data with you, and start the next round
 
-Colab only gives a couple of CPU cores, so this is much slower than a laptop
-— but it runs without any further upload, and it can be combined with the
-dataset you already have.
+The shards the background generator produced are worth keeping: they are
+teacher data for the *next* iteration.  The cell below packs them and stops
+the generator.
+
+To start the expert-iteration round -- the network becomes the teacher's leaf
+evaluation, so the teacher's data improves, so the next network is better --
+run this after the download:
 
 ```bash
-cd jungle-nnue/engine
-./build/selfplay --games 400 --threads $(nproc) --sims 800 \\
-                 --leaf-depth 1 --leaf-agg 1 --c-puct 1.4 \\
-                 --out /content/more/data
+cd engine
+./build/selfplay --games 2000 --threads $(nproc) --sims 800 \\
+                 --nnue ../net.nnue --leaf-depth 1 --leaf-agg 1 \\
+                 --out /content/round2/data
 ```
+"""),
+    code("""
+import glob, os, subprocess, tarfile
+subprocess.run(["pkill", "-f", "selfplay_loop.sh"])
 
-Download `/content/more/*.bin` and add them to the next run's dataset.
+shards = sorted(glob.glob("data/more/data.t*.bin"))
+print("new shards:", len(shards),
+      "%.1f MB" % (sum(os.path.getsize(s) for s in shards) / 1e6))
+if shards:
+    with tarfile.open("/content/jungle-dataset-round2.tar.gz", "w:gz") as tar:
+        for s in shards:
+            tar.add(s, arcname=os.path.basename(s))
+    print("packed /content/jungle-dataset-round2.tar.gz")
+    from google.colab import files
+    files.download("/content/jungle-dataset-round2.tar.gz")
 """),
 ]
 

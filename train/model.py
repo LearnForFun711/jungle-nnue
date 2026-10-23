@@ -94,23 +94,52 @@ def make_features(board, stm):
 
 
 def _ste_round_clip(x, lo=0.0, hi=127.0):
-    """round + clamp with a straight-through gradient."""
+    """round + clamp with a straight-through gradient.
+
+    The rounding is where the gradient has to be repaired.  ``torch.round``
+    has no derivative, so a straight-through estimator has to carry the
+    *pre-round* value into the graph:
+
+        r = round(x)
+        r = r + (x - x.detach())     # forward: round(x), gradient: 1
+
+    The clamp then clips the forward value while leaving that gradient
+    alone.  Deliberately letting the gradient reach units whose output is
+    currently clipped away matters: a unit that starts out of range would
+    otherwise have a gradient of exactly zero forever, and could never come
+    back.
+
+    (Getting this wrong is invisible from the loss curve alone -- the loss
+    simply plateaus at the variance of the target -- so `train.py` has a
+    self-check that asserts every parameter receives a gradient.)
+    """
     r = torch.round(x)
+    r = r + (x - x.detach())
     return r + (r.clamp(lo, hi) - r).detach()
 
 
 class QuantLinear(nn.Module):
     """Linear layer with per-output-row int8 quantisation (straight-through).
 
-    The layer output is ``gain * (x @ W^T)`` and is expected to be clipped to
-    [0,127] by the caller.  ``gain`` is a learnable positive scalar; it is
-    folded into the weights when the network is exported.
+    The layer output is ``bias + gain * (x @ W^T)`` and is expected to be
+    clipped to [0,127] by the caller.
+
+    ``gain`` is a learnable positive scalar; it is folded into the weights
+    when the network is exported.
+
+    ``bias`` is a learnable per-output-unit offset, and it is not optional:
+    the pre-activation of a unit whose weights are zero-mean is zero-mean
+    too, so with no bias roughly half of all units fall below zero and are
+    clipped away -- permanently, because a clipped unit produces no
+    gradient.  Half the network would be dead on arrival, and the layers
+    above it would have nothing to work with.
     """
 
-    def __init__(self, n_out, n_in, init_std=0.05):
+    def __init__(self, n_out, n_in, init_std=0.05, bias=0.0):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(n_out, n_in) * init_std)
         self.log_gain = nn.Parameter(torch.zeros(()))
+        self.bias = nn.Parameter(torch.full((n_out,), float(bias)))
 
     @property
     def gain(self):
@@ -126,15 +155,24 @@ class QuantLinear(nn.Module):
         wq, scale = self.quantised()
         wdq = wq * scale.unsqueeze(1)
         wdq = wdq.detach() + (self.weight - self.weight.detach())   # STE
-        return (x @ wdq.t()) * self.gain
+        return self.bias + (x @ wdq.t()) * self.gain
 
     def export(self):
-        """int8 weights and per-row scales with the gain folded in."""
+        """int8 weights, per-row scales and the bias, with the gain folded in.
+
+        Folding the gain into the weights leaves the int8 values untouched
+        (the per-row normalisation cancels it) and only scales the per-row
+        scale, so the exported network computes exactly what the trained one
+        does.
+        """
         gain = float(self.gain.detach())
         w = self.weight.detach() * gain
         m = w.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
         wq = torch.round(w / m * 127.0).clamp(-127, 127)
-        return wq.cpu().numpy().astype(np.int8), (m / 127.0).squeeze(1).cpu().numpy().astype(np.float32)
+        bias = self.bias.detach().cpu().numpy().astype(np.float32)
+        return (wq.cpu().numpy().astype(np.int8),
+                (m / 127.0).squeeze(1).cpu().numpy().astype(np.float32),
+                bias)
 
 
 class JungleNNUE(nn.Module):
@@ -142,18 +180,41 @@ class JungleNNUE(nn.Module):
 
     # Initial weight magnitudes chosen so that each layer's activations land
     # inside the [0,127] clipping range from the start.
-    FT_STD = 9.0
-    HID_STD = 0.09
-    OUT_STD = 4.0e-4
+    #
+    # The derivation, for a layer whose input is `n` values with mean `mu`
+    # and standard deviation `sd`:
+    #
+    #   pre[h] = sum_i W[h,i] * x[i]        (W zero-mean, independent)
+    #   std(pre) = init_std * sqrt(sum_i E[x_i^2])
+    #
+    # and the target spread of a hidden layer's output is ACT_SPREAD.
+    #
+    #   feature transformer: input is binary with ~15 occupied squares out
+    #     of 1008, so sum_i E[x_i^2] = 15 and init_std = 7.0 puts the output
+    #     spread at 7.0*sqrt(15) = 27.
+    #   hidden layers: input is 256 values with mean 64 and spread 27, so
+    #     sum_i E[x_i^2] = 256*(64^2 + 27^2) = 1.24e6 and
+    #     init_std = 27/sqrt(1.24e6) = 0.0243.
+    #   output layer: same input, but the output has to land in [-1,1] and
+    #     the target spread is ~0.25, so init_std = 0.25/sqrt(1.24e6).
+    FT_STD = 7.0
+    HID_STD = 0.024
+    OUT_STD = 2.2e-4
+
+    # The hidden layers' outputs are clipped to [0,127], so their bias is
+    # placed in the middle of that range; the output layer is not clipped
+    # and the target is centred on zero.
+    HID_BIAS = 64.0
+    OUT_BIAS = 0.0
 
     def __init__(self, ft_hidden=256, hidden=128):
         super().__init__()
         self.ft_hidden = ft_hidden
         self.hidden = hidden
-        self.ft = QuantLinear(ft_hidden, FT_INPUT, self.FT_STD)
-        self.h1 = QuantLinear(hidden, ft_hidden, self.HID_STD)
-        self.h2 = QuantLinear(hidden, hidden, self.HID_STD)
-        self.out = QuantLinear(1, 2 * hidden, self.OUT_STD)
+        self.ft = QuantLinear(ft_hidden, FT_INPUT, self.FT_STD, self.HID_BIAS)
+        self.h1 = QuantLinear(hidden, ft_hidden, self.HID_STD, self.HID_BIAS)
+        self.h2 = QuantLinear(hidden, hidden, self.HID_STD, self.HID_BIAS)
+        self.out = QuantLinear(1, 2 * hidden, self.OUT_STD, self.OUT_BIAS)
 
     def forward(self, feat_red, feat_black, stm=None):
         y = _ste_round_clip(self.ft(feat_red))
