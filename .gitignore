@@ -1,0 +1,25 @@
+# build artefacts
+engine/build/
+build/
+*.o
+*.so
+*.dylib
+
+# datasets and models (regenerable, and large)
+data/
+*.bin
+*.nnue
+runs/
+*.pt
+*.npz
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editors / OS
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,3 @@
+# Training only.  The engine itself has no dependencies.
+torch>=2.1
+numpy>=1.24
