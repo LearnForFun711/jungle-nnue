@@ -60,10 +60,17 @@ Produces:
 | `build/match` | engine-vs-engine match harness with Elo |
 | `build/dump_moves` | prints the legal moves of a position (rule checking) |
 | `build/eval_nnue` | prints the network's value for a position (parity checking) |
+| `build/nnue_check` | proves the incremental NNUE accumulators match a full refresh |
 | `build/bench` | micro-benchmarks of the hot paths |
 | `build/libjungle.so` | shared library with a flat C API for embedding |
 
 Only a C++17 compiler is required.
+
+Everything the CI checks can also be run locally:
+
+```bash
+scripts/verify_all.sh
+```
 
 ---
 
@@ -127,8 +134,8 @@ offset  size  meaning
 67      1     ending cause: 0 den entry, 1 no legal moves, 2 repetition, 3 length
 ```
 
-At 68 bytes a position, three million positions are 200 MB raw and about
-50 MB compressed — small enough to move in a single upload, which is why the
+At 68 bytes a position, the 3.7 million positions used here are 253 MB raw and
+**29 MB compressed** — small enough to move in a single upload, which is why the
 dataset is generated on the machine with the most cores and uploaded once.
 
 Inspect a dataset with:
@@ -163,6 +170,13 @@ features (2 perspectives) -> FT(1008 -> ft_hidden) -> H1(ft_hidden -> hidden)
   same rounding and clipping as the C++ inference, using a straight-through
   estimator.  The exported network therefore plays *exactly* the network that
   was trained — `scripts/verify_nnue.py` asserts this to within 1e-6.
+* **Fast enough to matter.**  A network that is stronger per evaluation but
+  three times slower is not stronger at all.  The feature transformer is stored
+  transposed so that a single piece update touches one contiguous run of
+  weights, and the search updates the accumulators incrementally as it
+  traverses the tree instead of rebuilding them at every node.  An evaluation
+  is then the forward pass and nothing else.  `engine/tools/nnue_check.cpp`
+  proves the two paths agree exactly.
 
 Per-layer quantisation, per output row:
 
@@ -203,14 +217,26 @@ python3 scripts/verify_nnue.py --checkpoint runs/exp/best.pt --net build/verify.
 the project, build the engine, find the dataset, train on the GPU, export the
 network and download it.
 
-```bash
-python3 scripts/make_colab_notebook.py     # regenerate the notebook
-```
+Open it from the repository page (**Open in Colab**), or directly:
+
+<https://colab.research.google.com/github.com/LearnForFun711/jungle-nnue/blob/main/colab/train_colab.ipynb>
+
+or clone this repository into a Colab runtime and open the notebook from
+there.  Then:
+
+1. Runtime ▸ Change runtime type ▸ **A100 GPU**, then restart.
+2. Run the cells in order.  The one that needs you is the dataset upload: drop
+   `jungle-dataset.tar.gz` (29 MB) into the runtime with the file pane.
+3. The last cell downloads `net.nnue` (about 300 KB).
 
 The dataset is the only thing that crosses the network and it is uploaded
 once; training happens entirely on the GPU.  For this model size an A100
 trains in a few minutes, so the GPU time is spent on *many* short runs rather
 than one long one.
+
+```bash
+python3 scripts/make_colab_notebook.py     # regenerate the notebook
+```
 
 ---
 
@@ -251,7 +277,7 @@ engine/
   src/nnue.hpp        int8 network: format, loading, inference
   src/search.hpp      iterative-deepening alpha-beta with a transposition table
   src/engine_api.hpp  one interface over alpha-beta and MCTS
-  tools/              selfplay, match, dump_moves, eval_nnue, bench
+  tools/              selfplay, match, dump_moves, eval_nnue, nnue_check, bench
 train/
   dataset.py          shard reader
   model.py            quantisation-aware NNUE
@@ -259,8 +285,11 @@ train/
   export_nnue.py      export to the engine's binary format
 scripts/
   verify_rules.py     C++ vs. reference rule check
+  verify_golden.py    C++ vs. recorded golden positions
   verify_nnue.py      torch vs. C++ parity check
   analyze_data.py     dataset quality report
+  package_data.py     pack the shards for a single upload
+  verify_all.sh       everything the CI checks
   make_colab_notebook.py
 colab/
   train_colab.ipynb
