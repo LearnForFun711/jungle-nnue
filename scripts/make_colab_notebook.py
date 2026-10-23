@@ -210,7 +210,7 @@ candidate is exported so they can be compared by playing strength.
 import os, sys, time
 
 BUDGET_MINUTES = int(os.environ.get("BUDGET_MINUTES", "480"))   # eight hours
-CONFIGS        = os.environ.get("CONFIGS", "256:128:0.25,384:192:0.25")
+CONFIGS        = os.environ.get("CONFIGS", "96:48:0.25,128:64:0.35,256:128:0.25")
 BATCH          = int(os.environ.get("BATCH", "8192"))
 LR             = float(os.environ.get("LR", "2e-3"))
 

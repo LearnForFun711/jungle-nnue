@@ -96,26 +96,33 @@ def make_features(board, stm):
 def _ste_round_clip(x, lo=0.0, hi=127.0):
     """round + clamp with a straight-through gradient.
 
-    The rounding is where the gradient has to be repaired.  ``torch.round``
-    has no derivative, so a straight-through estimator has to carry the
-    *pre-round* value into the graph:
+    Two separate things have to be got right here.
 
-        r = round(x)
+    *The rounding.*  ``torch.round`` has no derivative, so the pre-round
+    value has to be carried into the graph:
+
+        r = torch.round(x)
         r = r + (x - x.detach())     # forward: round(x), gradient: 1
 
-    The clamp then clips the forward value while leaving that gradient
-    alone.  Deliberately letting the gradient reach units whose output is
-    currently clipped away matters: a unit that starts out of range would
-    otherwise have a gradient of exactly zero forever, and could never come
-    back.
+    Without that, the gradient is identically zero for every layer that
+    feeds a quantised activation -- which is every layer but the last.
 
-    (Getting this wrong is invisible from the loss curve alone -- the loss
-    simply plateaus at the variance of the target -- so `train.py` has a
-    self-check that asserts every parameter receives a gradient.)
+    *The clamping.*  The clamp keeps its ordinary meaning: the gradient
+    stops where the value was clipped away.  That matters more than it
+    looks.  If the gradient were allowed through the clip, a unit that is
+    pinned at the top of the range would keep being pushed upwards, the
+    layer's weights would grow to compensate, and -- because the learning
+    rate is scaled with the weight magnitude -- the whole thing runs away:
+    the feature transformer's weights grew by a factor of 200 before the
+    run was stopped.
+
+    With a proper clamp the runaway cannot start, because a saturated unit
+    produces no gradient and so cannot be pushed any further.
     """
     r = torch.round(x)
     r = r + (x - x.detach())
-    return r + (r.clamp(lo, hi) - r).detach()
+    inside = (r.detach() >= lo) & (r.detach() <= hi)
+    return torch.where(inside, r, r.clamp(lo, hi).detach())
 
 
 class QuantLinear(nn.Module):

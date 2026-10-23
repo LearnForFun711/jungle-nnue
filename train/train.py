@@ -189,20 +189,31 @@ def main():
     # `--lr` meaningful at all.
     layers = [("ft", model.ft), ("h1", model.h1), ("h2", model.h2), ("out", model.out)]
 
-    def layer_lr(layer):
-        return args.lr * float(layer.weight.detach().abs().max())
+    # The layer's quantisation step is max|W|/127, and the learning rate is
+    # scaled with the weight magnitude so that lr/step is the same for every
+    # layer.  The scale is capped at a small multiple of the initial
+    # magnitude: if the weights ever grew, the learning rate would grow
+    # with them, and that is a feedback loop.
+    lr_cap = {}
+
+    def layer_lr(layer, name):
+        mag = float(layer.weight.detach().abs().max())
+        cap = lr_cap.get(name)
+        if cap is None:
+            cap = lr_cap[name] = 3.0 * mag
+        return args.lr * min(mag, cap)
 
     param_groups = []
     layer_groups = []
     for name, layer in layers:
-        w_group = {"params": [layer.weight], "lr": layer_lr(layer),
-                   "base_lr": layer_lr(layer), "name": f"{name}.weight"}
+        w_group = {"params": [layer.weight], "lr": layer_lr(layer, name),
+                   "base_lr": layer_lr(layer, name), "name": f"{name}.weight"}
         # The gain is not quantised, so it keeps the plain learning rate.
         g_group = {"params": [layer.log_gain], "lr": args.lr,
                    "base_lr": args.lr, "name": f"{name}.gain"}
         param_groups.append(w_group)
         param_groups.append(g_group)
-        layer_groups.append((layer, w_group))
+        layer_groups.append((name, layer, w_group))
 
     opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=1e-4,
                             betas=(0.9, 0.95))
@@ -243,8 +254,8 @@ def main():
         # Refresh the per-layer scaling: the weight magnitudes drift during
         # training, and the learning rate has to follow them to keep the
         # lr/quantisation-step ratio constant.
-        for layer, w_group in layer_groups:
-            w_group["base_lr"] = layer_lr(layer)
+        for name, layer, w_group in layer_groups:
+            w_group["base_lr"] = layer_lr(layer, name)
         perm = tr_idx.copy()
         np.random.default_rng(args.seed + epoch).shuffle(perm)
         for i in range(0, len(perm) - args.batch + 1, args.batch):
@@ -312,6 +323,18 @@ def main():
                 vn += len(idx)
         val = vs / max(1, vn)
         print(f"epoch {epoch}: val_loss {val:.6f}  ({(time.time()-start)/60:.1f} min)", flush=True)
+
+        # Activation health.  A layer whose units are clipped away is wasting
+        # its capacity, and a layer that saturates is on its way to the
+        # runaway that the learning-rate scaling can otherwise cause.
+        if epoch == 1 or epoch % 10 == 0:
+            try:
+                st = model.activation_stats(board_t[va_idx[:2048]].to(device).long(),
+                                            stm_t[va_idx[:2048]].to(device))
+                print("    activations: " + "  ".join(
+                    f"{k}={v:.3f}" for k, v in st.items()), flush=True)
+            except Exception as exc:      # diagnostics must never break a run
+                print(f"    (activation stats unavailable: {exc})", flush=True)
 
         # Re-aim the cosine schedule at the wall-clock budget.  The number of
         # epochs that fit in the budget is only known once the machine's

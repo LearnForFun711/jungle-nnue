@@ -199,15 +199,61 @@ Train:
 
 ```bash
 python3 train/train.py --data "data/data.t*.bin" --out runs/exp \
-        --epochs 12 --batch 8192 --lr 2e-3 --ft-hidden 256 --hidden 128
+        --epochs 40 --batch 8192 --lr 2e-3 --ft-hidden 128 --hidden 64
 ```
+
+or, to spend a wall-clock budget rather than a number of epochs:
+
+```bash
+python3 train/train_budget.py --data "data/data.t*.bin" --out runs/budget \
+        --minutes 480 --configs "128:64:0.25,96:48:0.35"
+```
+
+The learning-rate schedule is re-aimed at the budget after every epoch, so
+the rate decays across the whole run instead of stopping part-way through a
+schedule sized for fewer epochs.
 
 Export and verify:
 
 ```bash
 python3 train/export_nnue.py --checkpoint runs/exp/best.pt --out net.nnue
 python3 scripts/verify_nnue.py --checkpoint runs/exp/best.pt --net build/verify.nnue
+./engine/build/nnue_check net.nnue
 ```
+
+`verify_nnue.py` proves the PyTorch and C++ forward passes agree exactly;
+`nnue_check` proves the incremental accumulators the search maintains match a
+full refresh exactly.
+
+### How well does it work?
+
+Measured on a held-out shard of the dataset, as the correlation between the
+network's value and the *outcome of the game* the position came from, from
+the side-to-move's point of view:
+
+| | correlation with the game outcome |
+|---|---|
+| the handcrafted evaluation | +0.161 |
+| the MCTS teacher the network is distilled from | +0.160 |
+| **the distilled network** | **+0.187** |
+
+The network is a better predictor of who wins than the evaluation it
+replaces, which is the point.  The teacher is not: its value is a noisy
+estimate, and regressing on it removes the noise.
+
+The network width is a trade-off, and it is worth being explicit about it.
+A wider network predicts slightly better but evaluates more slowly, and at a
+fixed clock a slower engine searches less deeply.  The widths measured here:
+
+| network | MACs per evaluation | correlation with the outcome |
+|---|---|---|
+| 96 / 48 | 14k | +0.179 |
+| 256 / 128 | 99k | +0.187 |
+| 512 / 256 | 394k | — |
+
+A 96/48 network is nearly as good and seven times cheaper, which matters
+much more than the last few points of accuracy: at 1s per move the neural
+engine's evaluation cost is what decides how many nodes it can search.
 
 ---
 
