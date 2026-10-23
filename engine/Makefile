@@ -29,6 +29,10 @@ else
   LIBFLAGS := -shared
 endif
 
+# A shared object needs position-independent code.  macOS ignores -fPIC, so
+# it is harmless there, but Linux refuses to link the library without it.
+LIBFLAGS += -fPIC
+
 all: $(addprefix $(BUILD)/,$(TOOLS)) $(LIBFILE)
 
 $(BUILD)/%: tools/%.cpp $(wildcard src/*.hpp)

@@ -112,8 +112,11 @@ def main():
     target_all = (1.0 - w) * value_t + w * result_t
 
     # Keep everything on the GPU when it fits -- the feature construction is
-    # then essentially free.
-    gpu_bytes = board.size
+    # then essentially free.  The board is kept as uint8 (63 bytes per
+    # position), so the whole 3.7M-position dataset is under 300 MB.
+    gpu_bytes = (board_t.numel() * board_t.element_size()
+                 + stm_t.numel() * stm_t.element_size()
+                 + target_all.numel() * target_all.element_size())
     if device.type == "cuda" and gpu_bytes < 8e9:
         board_all = board_t.to(device)
         stm_all = stm_t.to(device)
@@ -249,4 +252,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # PyTorch's MPS backend intermittently segfaults while the interpreter
+    # tears down, *after* the training has finished and the checkpoint has
+    # been written.  In a Colab cell (or under `set -e`) that turns a
+    # successful run into a failed one.  Everything that matters is on disk
+    # by now, so skip the teardown entirely.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
