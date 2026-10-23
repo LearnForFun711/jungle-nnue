@@ -5,6 +5,7 @@
 // Python reference implementation in backend/engine.py.
 //
 //   echo "E8L/9/9/9/9/9/9/9/9 r" | ./dump_moves
+#include <algorithm>
 #include <cstdio>
 #include <iostream>
 #include <string>

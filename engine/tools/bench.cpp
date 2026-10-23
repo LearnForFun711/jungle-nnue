@@ -89,6 +89,7 @@ int main(int argc, char** argv) {
                 ft_red[h]   = clip127(fast_round(float(net.acc[RED][h]) * net.ft_scale[h]));
                 ft_black[h] = clip127(fast_round(float(net.acc[BLACK][h]) * net.ft_scale[h]));
             }
+            (void)ft_black;
             // time just the dot products
             const double t_dot = per_call([&] {
                 for (int o = 0; o < H; ++o)

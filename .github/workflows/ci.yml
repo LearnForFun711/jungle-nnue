@@ -25,25 +25,28 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install numpy torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install numpy torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
 
       - name: End-to-end check (train -> export -> parity -> match)
         run: |
           set -e
+          . .venv/bin/activate
           # A tiny dataset is enough to prove the whole pipeline works.
           mkdir -p /tmp/ci-data
           ./engine/build/selfplay --games 6 --threads 2 --sims 60 \
                                   --leaf-depth 1 --leaf-agg 1 \
                                   --out /tmp/ci-data/data
-          python3 train/train.py --data "/tmp/ci-data/data.t*.bin" \
-                                 --out /tmp/ci-run --epochs 1 --batch 512 \
-                                 --lr 1e-3 --ft-hidden 64 --hidden 32
-          python3 train/export_nnue.py --checkpoint /tmp/ci-run/best.pt \
-                                       --out /tmp/ci-run/net.nnue
-          python3 scripts/verify_nnue.py --checkpoint /tmp/ci-run/best.pt \
-                                         --net /tmp/ci-run/net.nnue \
-                                         --positions 60
+          python train/train.py --data "/tmp/ci-data/data.t*.bin" \
+                                --out /tmp/ci-run --epochs 1 --batch 512 \
+                                --lr 1e-3 --ft-hidden 64 --hidden 32
+          python train/export_nnue.py --checkpoint /tmp/ci-run/best.pt \
+                                      --out /tmp/ci-run/net.nnue
+          python scripts/verify_nnue.py --checkpoint /tmp/ci-run/best.pt \
+                                        --net /tmp/ci-run/net.nnue \
+                                        --positions 60
           ./engine/build/nnue_check /tmp/ci-run/net.nnue 5 60
           ./engine/build/match --games 4 --threads 2 --time 0.02 \
                                 --engine-a "ab:nnue=/tmp/ci-run/net.nnue" \
