@@ -42,7 +42,7 @@ int main(int argc, char** argv) {
             continue;
         }
         nnue_refresh(net, pos);
-        const float v = nnue_forward(net, pos);   // side to move's perspective
+        const float v = nnue_forward(net, pos.stm);   // side to move's perspective
         std::printf("%.6f\n", double(v));
     }
     return 0;

@@ -78,29 +78,77 @@ int main(int argc, char** argv) {
                     el / sims * 1e6, sims / el);
     }
 
+    // NNUE evaluation breakdown.
+    {
+        NnueNetwork net;
+        if (nnue_load("../build/net_256_128.nnue", net)) {
+            const int FH = net.ft_hidden, H = net.hidden;
+            nnue_refresh(net, pos);
+            int8_t ft_red[1024], ft_black[1024];
+            for (int h = 0; h < FH; ++h) {
+                ft_red[h]   = clip127(fast_round(float(net.acc[RED][h]) * net.ft_scale[h]));
+                ft_black[h] = clip127(fast_round(float(net.acc[BLACK][h]) * net.ft_scale[h]));
+            }
+            // time just the dot products
+            const double t_dot = per_call([&] {
+                for (int o = 0; o < H; ++o)
+                    sink += dot_i8(net.h_w[0].data() + size_t(o) * FH, ft_red, FH);
+            }, reps);
+            // time just the per-element float scale + round + clamp
+            const double t_scale = per_call([&] {
+                for (int h = 0; h < FH; ++h)
+                    sink += clip127(fast_round(float(net.acc[RED][h]) * net.ft_scale[h]));
+            }, reps);
+            std::printf("nnue breakdown: h1 dot products %.3f us | %d float scale+round+clamp %.3f us\n",
+                        t_dot, FH, t_scale);
+        }
+    }
+
     // NNUE evaluation speed.
     {
         NnueNetwork net;
         if (nnue_load("../build/net_512_256.nnue", net)) {
             const double t_nn = per_call([&] {
                 nnue_refresh(net, pos);
-                sink += int(nnue_forward(net, pos) * 1000.0f);
+                sink += int(nnue_forward(net, pos.stm) * 1000.0f);
             }, reps);
             std::printf("nnue eval (512/256): %.3f us\n", t_nn);
         }
         if (nnue_load("../build/net_512_128.nnue", net)) {
             const double t_nn = per_call([&] {
                 nnue_refresh(net, pos);
-                sink += int(nnue_forward(net, pos) * 1000.0f);
+                sink += int(nnue_forward(net, pos.stm) * 1000.0f);
             }, reps);
             std::printf("nnue eval (512/128): %.3f us\n", t_nn);
         }
         if (nnue_load("../build/net_256_128.nnue", net)) {
             const double t_nn = per_call([&] {
                 nnue_refresh(net, pos);
-                sink += int(nnue_forward(net, pos) * 1000.0f);
+                sink += int(nnue_forward(net, pos.stm) * 1000.0f);
             }, reps);
             std::printf("nnue eval (256/128): %.3f us\n", t_nn);
+
+            // The path the search actually uses: the accumulators are kept up
+            // to date incrementally, so an evaluation is the forward pass only.
+            Evaluator ev;
+            ev.net = net;
+            ev.refresh(pos);
+            Move first[128];
+            const int nf = generate_moves(pos, first);
+            const Move m = first[0];
+            const double t_incr = per_call([&] {
+                const int moved    = pos.board[m.from];
+                const int captured = pos.board[m.to];
+                ev.on_move(m.from, m.to, moved, captured, true);
+                sink += ev.eval_cached(pos);
+                ev.on_move(m.from, m.to, moved, captured, false);
+            }, reps);
+            std::printf("nnue eval (256/128) incremental: %.3f us\n", t_incr);
+            std::printf("  (legal moves at this position: %d)\n", nf);
+
+            // How long a full refresh costs on its own.
+            const double t_refresh = per_call([&] { nnue_refresh(net, pos); }, reps);
+            std::printf("nnue refresh only: %.3f us\n", t_refresh);
         }
     }
 

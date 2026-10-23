@@ -68,7 +68,7 @@ struct NnueNetwork {
     uint32_t hidden    = 0;
     uint32_t num_layers = 2;
 
-    std::vector<int8_t>  ft_w;    // [ft_hidden][FT_INPUT]
+    std::vector<int8_t>  ft_w;    // [FT_INPUT][ft_hidden]  (transposed)
     std::vector<float>   ft_scale;// [ft_hidden]
     std::vector<int8_t>  h_w[2];  // [hidden][in]
     std::vector<float>   h_scale[2];
@@ -86,13 +86,13 @@ struct NnueNetwork {
 // ---------------------------------------------------------------------------
 //
 //   char[8]  "JNNUE\0\0\0"
-//   uint32   version = 1
+//   uint32   version = 2
 //   uint32   ft_hidden
 //   uint32   hidden
 //   uint32   num_layers
 //   uint32   num_buckets
 //   uint32   num_squares
-//   int8     ft_w    [ft_hidden][FT_INPUT]
+//   int8     ft_w    [FT_INPUT][ft_hidden]   (transposed, see below)
 //   float32  ft_scale[ft_hidden]
 //   int8     h0_w    [hidden][ft_hidden]
 //   float32  h0_scale[hidden]
@@ -102,6 +102,14 @@ struct NnueNetwork {
 //   float32  out_scale
 //
 // All scalars are little-endian.
+//
+// The feature transformer is stored *transposed* with respect to the natural
+// [ft_hidden][FT_INPUT] layout: feature `f` owns a contiguous run of
+// `ft_hidden` weights.  A search updates the accumulators one piece at a
+// time, and in the natural layout a single piece update strides through the
+// whole 250 KiB matrix (one cache line per hidden unit).  Transposed, one
+// piece touches two contiguous 256-byte runs instead, which is what makes the
+// incremental evaluation affordable.
 
 inline bool nnue_load(const std::string& path, NnueNetwork& net) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -124,10 +132,10 @@ inline bool nnue_load(const std::string& path, NnueNetwork& net) {
     if (!read_u32(version) || !read_u32(net.ft_hidden) || !read_u32(net.hidden) ||
         !read_u32(net.num_layers) || !read_u32(buckets) || !read_u32(squares))
         return false;
-    if (version != 1 || buckets != NUM_BUCKETS || squares != NUM_SQ) return false;
+    if (version != 2 || buckets != NUM_BUCKETS || squares != NUM_SQ) return false;
     if (net.num_layers != 2) return false;
 
-    net.ft_w.resize(size_t(net.ft_hidden) * FT_INPUT);
+    net.ft_w.resize(size_t(FT_INPUT) * net.ft_hidden);
     net.ft_scale.resize(net.ft_hidden);
     net.h_w[0].resize(size_t(net.hidden) * net.ft_hidden);
     net.h_scale[0].resize(net.hidden);
@@ -197,26 +205,45 @@ inline int32_t fast_round(float v) {
 
 // Add / remove the contribution of one piece to the two FT accumulators.
 //
-// The feature transformer is stored as a [ft_hidden][FT_INPUT] row-major
-// matrix, so the weight of feature `f` in hidden unit `h` lives at
-// `ft_w[h * FT_INPUT + f]` -- the stride between hidden units is FT_INPUT,
-// not 1.
+// The feature transformer is stored *transposed*: feature `f` owns a
+// contiguous run of `ft_hidden` weights.  That matters a lot -- with the
+// natural [ft_hidden][FT_INPUT] layout a single piece update strides through
+// the whole matrix and thrashes the cache, which made the refresh the
+// dominant cost of an evaluation.  Transposed, one piece touches two
+// contiguous 256-byte runs.
 inline void nnue_add_piece(NnueNetwork& net, int sq, int piece, int sign) {
     const int f_red   = feature_index(sq, piece, RED);
     const int f_black = feature_index(sq, piece, BLACK);
-    const int8_t* col_red   = net.ft_w.data() + f_red;
-    const int8_t* col_black = net.ft_w.data() + f_black;
-    const size_t stride = FT_INPUT;
+    const int8_t* row_red   = net.ft_w.data() + size_t(f_red) * net.ft_hidden;
+    const int8_t* row_black = net.ft_w.data() + size_t(f_black) * net.ft_hidden;
     if (sign > 0) {
         for (uint32_t h = 0; h < net.ft_hidden; ++h) {
-            net.acc[RED][h]   += col_red[size_t(h) * stride];
-            net.acc[BLACK][h] += col_black[size_t(h) * stride];
+            net.acc[RED][h]   += row_red[h];
+            net.acc[BLACK][h] += row_black[h];
         }
     } else {
         for (uint32_t h = 0; h < net.ft_hidden; ++h) {
-            net.acc[RED][h]   -= col_red[size_t(h) * stride];
-            net.acc[BLACK][h] -= col_black[size_t(h) * stride];
+            net.acc[RED][h]   -= row_red[h];
+            net.acc[BLACK][h] -= row_black[h];
         }
+    }
+}
+
+// Update the accumulators for a move that has just been made (or undone).
+//
+// `moved` is the piece that moved (always non-zero), `captured` the piece that
+// stood on the destination (0 when the move was quiet).  `forward` selects
+// make-move (true) or unmake-move (false).
+inline void nnue_move_piece(NnueNetwork& net, int from, int to,
+                             int moved, int captured, bool forward) {
+    if (forward) {
+        if (captured) nnue_add_piece(net, to, captured, -1);
+        nnue_add_piece(net, from, moved, -1);
+        nnue_add_piece(net, to, moved, +1);
+    } else {
+        nnue_add_piece(net, to, moved, -1);
+        nnue_add_piece(net, from, moved, +1);
+        if (captured) nnue_add_piece(net, to, captured, +1);
     }
 }
 
@@ -228,15 +255,6 @@ inline void nnue_refresh(NnueNetwork& net, const Position& pos) {
         const int p = pos.board[s];
         if (p) nnue_add_piece(net, s, p, +1);
     }
-}
-
-// Apply a move to the accumulators (the board must already reflect it).
-inline void nnue_apply_move(NnueNetwork& net, const Position& before, Move m) {
-    const int moved = before.board[m.from];
-    const int captured = before.board[m.to];
-    if (captured) nnue_add_piece(net, m.to, captured, -1);
-    if (moved) nnue_add_piece(net, m.from, moved, -1);
-    nnue_add_piece(net, m.to, moved, +1);
 }
 
 struct NnueOutput {
@@ -253,8 +271,10 @@ inline int8_t clip127(int32_t v) {
 }
 
 // Run the network forward and return the raw value *from the side to move's
-// point of view*.
-inline float nnue_forward(const NnueNetwork& net, const Position& pos) {
+// point of view*.  `stm` is the side to move (RED or BLACK); it is the only
+// part of the position the forward pass needs, because the feature
+// accumulators already carry the rest.
+inline float nnue_forward(const NnueNetwork& net, int stm) {
     const int FH = net.ft_hidden;
     const int H  = net.hidden;
 
@@ -283,7 +303,7 @@ inline float nnue_forward(const NnueNetwork& net, const Position& pos) {
     // that comes out is therefore already from the side to move's point of
     // view and must not be sign-flipped anywhere else.
     int8_t joint[2 * 1024];
-    if (pos.stm == RED) {
+    if (stm == RED) {
         std::memcpy(joint, h1_red, H);
         std::memcpy(joint + H, h1_black, H);
     } else {
@@ -306,13 +326,47 @@ struct Evaluator {
 
     bool uses_nnue() const { return net.valid(); }
 
+    // Side to move that the cached accumulators belong to.  The search keeps
+    // it in step with the position; the forward pass needs it to order the
+    // two perspectives.
+    int stm_ = RED;
+
+    // Full evaluation: refreshes the accumulators from the position first.
     int eval(const Position& pos) {
         if (uses_nnue()) {
             nnue_refresh(net, pos);
-            const float v = nnue_forward(net, pos);  // side to move's perspective
-            return int(std::lround(v * 1000.0f));
+            stm_ = pos.stm;
+            return forward_value();
         }
-        return evaluate(pos);
+        return jungle::evaluate(pos);
+    }
+
+    // Evaluation of the position the accumulators currently describe.
+    // Without a network this falls back to the handcrafted evaluation, which
+    // does need the position -- hence the argument.
+    int eval_cached(const Position& pos) {
+        if (!uses_nnue()) return jungle::evaluate(pos);
+        return forward_value();
+    }
+
+    // Bring the accumulators in line with `pos` from scratch.
+    void refresh(const Position& pos) {
+        if (!uses_nnue()) return;
+        nnue_refresh(net, pos);
+        stm_ = pos.stm;
+    }
+
+    // Account for a move that has just been made (forward) or unmade
+    // (!forward).  The side to move flips in both cases.
+    void on_move(int from, int to, int moved, int captured, bool forward) {
+        if (!uses_nnue()) return;
+        nnue_move_piece(net, from, to, moved, captured, forward);
+        stm_ ^= 1;
+    }
+
+    int forward_value() const {
+        const float v = nnue_forward(net, stm_);  // side to move's view
+        return int(std::lround(v * 1000.0f));
     }
 };
 

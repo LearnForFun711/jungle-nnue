@@ -66,6 +66,11 @@ public:
         aborted_ = false;
         history_ = &history;
 
+        // Bring the NNUE feature accumulators in line with the root
+        // position; from here on they are maintained incrementally by
+        // on_move() as the tree is traversed.
+        ev_.refresh(pos);
+
         SearchResult best;
         best.move = Move{0xFFFF, 0xFFFF};
 
@@ -217,8 +222,10 @@ private:
                 break;
             }
 
+            const int moved    = pos.board[m.from];
             const int captured = pos.board[m.to];
             make_move(pos, m);
+            ev_.on_move(m.from, m.to, moved, captured, true);
             history_->push_back(pos.key);
 
             int score;
@@ -235,6 +242,7 @@ private:
 
             history_->pop_back();
             undo_move(pos, m, captured);
+            ev_.on_move(m.from, m.to, moved, captured, false);
 
             if (aborted_) return 0;
 
@@ -266,7 +274,7 @@ private:
             aborted_ = true;
             return 0;
         }
-        int stand = ev_.eval(pos);
+        int stand = ev_.eval_cached(pos);
         if (stand >= beta) return stand;
         if (stand > alpha) alpha = stand;
 
@@ -280,12 +288,15 @@ private:
             if (!pos.board[m.to]) continue;                 // captures only
             if (terrain().den_owner[m.to] == opposite_color(pos.stm))
                 return MATE_SCORE - ply - 1;
+            const int moved    = pos.board[m.from];
             const int captured = pos.board[m.to];
             make_move(pos, m);
+            ev_.on_move(m.from, m.to, moved, captured, true);
             history_->push_back(pos.key);
             const int score = -quiesce(pos, -beta, -alpha, ply + 1);
             history_->pop_back();
             undo_move(pos, m, captured);
+            ev_.on_move(m.from, m.to, moved, captured, false);
             if (aborted_) return 0;
             if (score >= beta) return score;
             if (score > alpha) alpha = score;

@@ -44,6 +44,7 @@ jobs:
           python3 scripts/verify_nnue.py --checkpoint /tmp/ci-run/best.pt \
                                          --net /tmp/ci-run/net.nnue \
                                          --positions 60
+          ./engine/build/nnue_check /tmp/ci-run/net.nnue 5 60
           ./engine/build/match --games 4 --threads 2 --time 0.02 \
                                 --engine-a "ab:nnue=/tmp/ci-run/net.nnue" \
                                 --engine-b ab

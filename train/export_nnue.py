@@ -5,13 +5,13 @@ C++ engine (``engine/src/nnue.hpp``).
 The exported file is self-describing:
 
     char[8]  "JNNUE\\0\\0\\0"
-    uint32   version = 1
+    uint32   version = 2
     uint32   ft_hidden
     uint32   hidden
     uint32   num_layers = 2
     uint32   num_buckets = 16
     uint32   num_squares = 63
-    int8     ft_w     [ft_hidden][1008]
+    int8     ft_w     [1008][ft_hidden]   (transposed)
     float32  ft_scale [ft_hidden]
     int8     h0_w     [hidden][ft_hidden]
     float32  h0_scale [hidden]
@@ -19,6 +19,11 @@ The exported file is self-describing:
     float32  h1_scale [hidden]
     int8     out_w    [2*hidden]
     float32  out_scale
+
+The feature transformer is written transposed with respect to the torch
+layout ``[ft_hidden, 1008]``: the C++ engine updates the accumulators one
+piece at a time, and the transposed layout lets a single piece update touch
+one contiguous run of weights instead of striding through the whole matrix.
 """
 import argparse
 import os
@@ -44,11 +49,14 @@ def export(model, path):
     h1_w, h1_scale = model.h2.export()
     out_w, out_scale = model.out.export()
 
+    # [ft_hidden, FT_INPUT] -> [FT_INPUT, ft_hidden]
+    ft_w_t = np.ascontiguousarray(ft_w.T)
+
     with open(path, "wb") as f:
         f.write(MAGIC)
-        f.write(struct.pack("<6I", 1, model.ft_hidden, model.hidden, 2,
+        f.write(struct.pack("<6I", 2, model.ft_hidden, model.hidden, 2,
                             NUM_BUCKETS, NUM_SQUARES))
-        f.write(ft_w.astype(np.int8).tobytes())
+        f.write(ft_w_t.astype(np.int8).tobytes())
         f.write(ft_scale.astype(np.float32).tobytes())
         f.write(h0_w.astype(np.int8).tobytes())
         f.write(h0_scale.astype(np.float32).tobytes())

@@ -18,7 +18,7 @@ ifeq ($(NATIVE),1)
   CXXFLAGS += -march=native
 endif
 
-TOOLS := selfplay match dump_moves bench eval_nnue
+TOOLS := selfplay match dump_moves bench eval_nnue nnue_check
 LIB   := libjungle
 
 ifeq ($(shell uname),Darwin)

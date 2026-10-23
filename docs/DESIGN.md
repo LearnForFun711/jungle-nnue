@@ -54,11 +54,36 @@ distillation to be worth anything.
   breakdown of the correlation, not the aggregate number.
 
 * **The feature transformer was indexed as a flat array.**  The weights are
-  stored as `[ft_hidden][FT_INPUT]`, and the accumulator update walked the
-  flat array instead of the matrix column, so it added the wrong weights for
-  every hidden unit.  The network still "worked" — it produced numbers — which
-  is why the only thing that caught it was asserting that the PyTorch and C++
-  forward passes agree.  `scripts/verify_nnue.py` exists for exactly this.
+  stored as `[FT_INPUT][ft_hidden]` (transposed, see below), and the accumulator
+  update walked the flat array instead of the matrix row, so it added the wrong
+  weights for every hidden unit.  The network still "worked" — it produced
+  numbers — which is why the only thing that caught it was asserting that the
+  PyTorch and C++ forward passes agree.  `scripts/verify_nnue.py` exists for
+  exactly this.
+
+## Making the network fast enough to matter
+
+A network that is stronger per evaluation but three times slower is not
+stronger at all: the search simply visits a third of the nodes.  The first
+working version rebuilt the feature transformer from scratch at every node,
+and the layout made that as slow as it could possibly be.
+
+The feature transformer is stored **transposed**: feature `f` owns a
+contiguous run of `ft_hidden` weights instead of the hidden unit owning a
+contiguous run of `FT_INPUT` weights.  In the natural layout a single piece
+update strides through the entire 250 KiB matrix and touches one cache line per
+hidden unit; transposed, it touches two contiguous 256-byte runs.
+
+On top of that the search no longer rebuilds the accumulators at all.  It
+updates them incrementally as it descends and un-descends the tree, so an
+evaluation is the forward pass and nothing else.  The search therefore pays
+about one piece update per edge instead of one full rebuild per node.
+
+This is the kind of change that is easy to get subtly wrong, so it is checked
+rather than trusted: `engine/tools/nnue_check.cpp` walks random legal games
+and compares the incrementally maintained accumulators against a full refresh
+at every position, including after unmaking moves.  The two must agree
+*exactly* — not approximately, not within a tolerance.
 
 ## Quantisation
 
