@@ -42,12 +42,22 @@ once.  Training then happens entirely on the GPU.
 """),
     md("## 1. Environment"),
     code("""
-!pip install -q torch --index-url https://download.pytorch.org/whl/cu121
+# Colab already ships a CUDA build of PyTorch that matches the runtime's
+# driver.  Only install one if the runtime has no GPU at all -- installing a
+# different CUDA wheel can break the runtime.
+import subprocess, sys
+
+if subprocess.run(["nvidia-smi"], capture_output=True).returncode != 0:
+    print("no GPU visible -- installing a CUDA build of torch")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "torch",
+                    "--index-url", "https://download.pytorch.org/whl/cu121"], check=False)
+
 import torch
 print("torch", torch.__version__, "| cuda", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("device:", torch.cuda.get_device_name(0))
-    print("memory: %.1f GB" % (torch.cuda.get_device_properties(0).total_memory / 1e9))
+if not torch.cuda.is_available():
+    raise SystemExit("no CUDA device -- did you pick an A100 runtime?")
+print("device:", torch.cuda.get_device_name(0))
+print("memory: %.1f GB" % (torch.cuda.get_device_properties(0).total_memory / 1e9))
 """),
     md("## 2. Get the project"),
     code("""
