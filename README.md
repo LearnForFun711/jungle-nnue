@@ -73,16 +73,26 @@ Only a C++17 compiler is required.
 Dirichlet noise at the root and a search-based leaf evaluation.
 
 The leaf evaluation is the interesting part.  A plain static evaluation gives
-the teacher values that are *worse* than the handcrafted evaluation it is
-meant to replace.  Evaluating every child position and averaging (rather than
-taking the maximum — the maximum of many noisy samples is biased towards
-zero) gives a teacher that is measurably better:
+the teacher values that are no better than the handcrafted evaluation it is
+meant to replace — training on it would not produce a network worth having.
+Evaluating every child position and averaging (rather than taking the
+maximum — the maximum of many noisy samples is biased towards zero) gives a
+teacher that is measurably better.
+
+Measured as the Pearson correlation between the teacher's value and the actual
+outcome of the game the position came from, both from the side-to-move's point
+of view, over ~40k positions each:
 
 | leaf evaluation | correlation with the game outcome |
 |---|---|
-| handcrafted static evaluation | +0.201 |
-| MCTS, static leaf | +0.212 |
-| MCTS, 1-ply leaf, mean aggregation | **+0.233** |
+| handcrafted static evaluation (the thing to beat) | +0.201 |
+| MCTS, static leaf | +0.205 |
+| **MCTS, 1-ply leaf, mean aggregation** | **+0.233** |
+
+For reference, the same correlation measured only over the positions late in
+a game (ply 120+) is +0.446 for the 1-ply teacher — the signal is
+concentrated where the game is actually decided, which is what you would
+expect.
 
 The 1-ply leaf costs roughly eight times as much as a static leaf, which is
 the main trade-off in the whole project: teacher quality against data volume.
