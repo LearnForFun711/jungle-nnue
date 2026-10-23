@@ -63,6 +63,9 @@ def main():
     ap.add_argument("--samples", type=int, default=400)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--binary", default=os.path.join(ENGINE_DIR, "build", "dump_moves"))
+    ap.add_argument("--write-golden", default="",
+                    help="write the sampled positions and their reference legal "
+                         "moves to this file instead of comparing")
     args = ap.parse_args()
 
     if not os.path.exists(args.binary):
@@ -94,6 +97,22 @@ def main():
             break
 
     print(f"sampled {len(fens)} positions from {args.games} random games")
+
+    if args.write_golden:
+        # The golden file is produced from the *reference* implementation, so it
+        # encodes the reference behaviour, not the C++ behaviour.
+        with open(args.write_golden, "w") as f:
+            f.write("# Jungle Chess rule golden file.\n")
+            f.write("# Each line: <FEN> | <move> <move> ...\n")
+            f.write("# Generated from the reference Python implementation by\n")
+            f.write("# scripts/verify_rules.py --write-golden\n")
+            for fen, moves in zip(fens, py_sets):
+                names = sorted(f"{chr(ord('a') + fc)}{9 - fr}{chr(ord('a') + tc)}{9 - tr}"
+                               for (fr, fc), (tr, tc) in moves)
+                f.write(fen + " | " + " ".join(names) + "\n")
+        print(f"wrote {args.write_golden} with {len(fens)} positions")
+        return 0
+
     cpp_sets = cpp_moves(args.binary, fens)
 
     bad = 0

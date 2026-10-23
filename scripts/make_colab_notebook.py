@@ -54,17 +54,27 @@ if torch.cuda.is_available():
 import os, subprocess, sys
 
 REPO_URL = "https://github.com/LearnForFun711/jungle-nnue.git"
-if os.path.isdir("jungle-nnue/.git"):
-    print("already present")
-else:
+
+def find_project():
+    # Already inside the project (e.g. "Open in Colab" from the GitHub page).
+    if os.path.isfile("train/train.py"):
+        return os.getcwd()
+    if os.path.isdir("jungle-nnue/train"):
+        return os.path.abspath("jungle-nnue")
+    return None
+
+root = find_project()
+if root is None:
     r = subprocess.run(["git", "clone", "--depth", "1", REPO_URL, "jungle-nnue"])
     if r.returncode != 0:
         raise SystemExit(
             "git clone failed -- if the repo is private, clone it manually and unzip it "
             "to /content/jungle-nnue instead.")
+    root = os.path.abspath("jungle-nnue")
 
-os.chdir("jungle-nnue")
+os.chdir(root)
 print("project at", os.getcwd())
+print("contents:", sorted(os.listdir("."))[:12])
 """),
     code("""
 # Build the C++ engine.  It is used for the parity check at the end and for
@@ -111,12 +121,16 @@ if not shards:
 If you prefer not to use the file pane, the cell below opens a file chooser.
 """),
     code("""
+# Uncomment and run this if you would rather upload with a file chooser than
+# use the file pane.  Pick jungle-dataset.tar.gz.
+#
 # from google.colab import files
-# uploaded = files.upload()          # pick jungle-dataset.tar.gz
+# uploaded = files.upload()
 # for name in uploaded:
 #     with tarfile.open(name) as tar:
 #         tar.extractall(DATA_DIR)
-# print("unpacked", list(uploaded))
+# shards = sorted(glob.glob(os.path.join(DATA_DIR, "data.t*.bin")))
+# print("shards:", len(shards))
 """),
     md("""
 ## 4. Train

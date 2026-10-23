@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the engine
+        run: make -C engine -j4
+
+      - name: Rule golden test
+        run: python3 scripts/verify_golden.py
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install numpy torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+
+      - name: End-to-end check (train -> export -> parity -> match)
+        run: |
+          set -e
+          # A tiny dataset is enough to prove the whole pipeline works.
+          mkdir -p /tmp/ci-data
+          ./engine/build/selfplay --games 2 --threads 2 --sims 60 \
+                                  --leaf-depth 1 --leaf-agg 1 \
+                                  --out /tmp/ci-data/data
+          python3 train/train.py --data "/tmp/ci-data/data.t*.bin" \
+                                 --out /tmp/ci-run --epochs 1 --batch 512 \
+                                 --lr 1e-3 --ft-hidden 64 --hidden 32
+          python3 train/export_nnue.py --checkpoint /tmp/ci-run/best.pt \
+                                       --out /tmp/ci-run/net.nnue
+          python3 scripts/verify_nnue.py --checkpoint /tmp/ci-run/best.pt \
+                                         --net /tmp/ci-run/net.nnue \
+                                         --positions 60
+          ./engine/build/match --games 4 --threads 2 --time 0.02 \
+                                --engine-a "ab:nnue=/tmp/ci-run/net.nnue" \
+                                --engine-b ab
