@@ -2,8 +2,9 @@
 """Generate the Colab notebook (colab/train_colab.ipynb).
 
 The notebook is the whole "train on the A100" story in one file: it fetches
-the project, builds the engine, finds the dataset, trains the network, exports
-it to the engine's binary format and hands back a download.
+the project, uploads and unpacks the dataset, trains the network, exports it
+to the engine's binary format, verifies that the PyTorch and C++ forward
+passes agree and hands back a download.
 
 Keeping it generated from a script (rather than hand-written JSON) means the
 notebook can be regenerated when the training options change.
@@ -31,21 +32,19 @@ CELLS = [
 This notebook trains the neural network on the MCTS self-play dataset and
 exports it to the binary format the C++ engine reads.
 
-**What you need**
+**Before you run anything**
 
-1. A Colab Pro+ runtime with an **A100 GPU** (Runtime ▸ Change runtime type).
-2. The dataset. Either
-   * mount Google Drive and put the shards somewhere, or
-   * upload `data/data.t*.bin` to the runtime's file pane.
+1. Runtime ▸ Change runtime type ▸ **A100 GPU**, then restart.
+2. Run the cells below in order.  Cell 3 asks you for the dataset file.
 
 The dataset is the only thing that crosses the network, and it is uploaded
-**once**.  Training happens entirely on the GPU.
+once.  Training then happens entirely on the GPU.
 """),
     md("## 1. Environment"),
     code("""
 !pip install -q torch --index-url https://download.pytorch.org/whl/cu121
-import torch, sys
-print("torch", torch.__version__, "cuda", torch.cuda.is_available())
+import torch
+print("torch", torch.__version__, "| cuda", torch.cuda.is_available())
 if torch.cuda.is_available():
     print("device:", torch.cuda.get_device_name(0))
     print("memory: %.1f GB" % (torch.cuda.get_device_properties(0).total_memory / 1e9))
@@ -54,54 +53,76 @@ if torch.cuda.is_available():
     code("""
 import os, subprocess, sys
 
-REPO_URL = "https://github.com/LearnForFun711/jungle-nnue.git"   # change if needed
+REPO_URL = "https://github.com/LearnForFun711/jungle-nnue.git"
 if os.path.isdir("jungle-nnue/.git"):
     print("already present")
 else:
     r = subprocess.run(["git", "clone", "--depth", "1", REPO_URL, "jungle-nnue"])
     if r.returncode != 0:
         raise SystemExit(
-            "git clone failed -- either the repo is private or the URL is wrong.\\n"
-            "You can also upload the project as a zip and unzip it to /content/jungle-nnue.")
+            "git clone failed -- if the repo is private, clone it manually and unzip it "
+            "to /content/jungle-nnue instead.")
 
 os.chdir("jungle-nnue")
 print("project at", os.getcwd())
 """),
     code("""
-# Build the C++ engine (used for extra self-play and for the final match).
+# Build the C++ engine.  It is used for the parity check at the end and for
+# generating extra self-play data on the VM.
 !make -C engine NATIVE=1 -j4
 """),
     md("""
-## 3. Locate the dataset
+## 3. Upload the dataset
 
-The trainer reads the shards produced by `engine/tools/selfplay.cpp`.
-Every file matching `data/data.t*.bin` is read.
+Click the folder icon in the Colab file pane (or use the button in the cell
+below) and choose **`jungle-dataset.tar.gz`** from your computer.
+
+It is the only file you need to move.
 """),
     code("""
-import glob, os
+import os, glob, tarfile
 
-def find_data():
-    candidates = []
-    # 1. uploaded into the runtime
-    candidates += sorted(glob.glob("/content/data/data.t*.bin"))
-    candidates += sorted(glob.glob("/content/*.bin"))
-    # 2. Google Drive mounted
-    if os.path.isdir("/content/drive/MyDrive"):
-        candidates += sorted(glob.glob("/content/drive/MyDrive/**/*.t*.bin", recursive=True))
-    return candidates
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-files = find_data()
-print("found", len(files), "shards")
-for f in files[:10]:
-    print("  ", f, os.path.getsize(f) / 1e6, "MB")
+shards = sorted(glob.glob(os.path.join(DATA_DIR, "data.t*.bin")))
+archives = sorted(glob.glob(os.path.join(DATA_DIR, "*.tar.gz"))) + \\
+           sorted(glob.glob("/content/*.tar.gz")) + \\
+           sorted(glob.glob("/content/*.tgz"))
+
+if not shards and archives:
+    for a in archives:
+        print("unpacking", a)
+        with tarfile.open(a) as tar:
+            tar.extractall(DATA_DIR)
+    shards = sorted(glob.glob(os.path.join(DATA_DIR, "data.t*.bin")))
+
+print("shards found:", len(shards))
+total = sum(os.path.getsize(s) for s in shards)
+print("total: %.1f MB  (~%.0fk positions)" % (total / 1e6, total / 68 / 1000))
+for s in shards[:5]:
+    print("  ", s, "%.1f MB" % (os.path.getsize(s) / 1e6))
+if not shards:
+    raise SystemExit("No dataset found.  Upload jungle-dataset.tar.gz into data/ first.")
+"""),
+    md("""
+### Or upload it right here
+
+If you prefer not to use the file pane, the cell below opens a file chooser.
+"""),
+    code("""
+# from google.colab import files
+# uploaded = files.upload()          # pick jungle-dataset.tar.gz
+# for name in uploaded:
+#     with tarfile.open(name) as tar:
+#         tar.extractall(DATA_DIR)
+# print("unpacked", list(uploaded))
 """),
     md("""
 ## 4. Train
 
 `--data` is a glob.  The trainer keeps the whole dataset on the GPU when it
 fits, which makes the feature construction essentially free.
-
-Knobs worth knowing:
 
 | flag | meaning |
 |---|---|
@@ -110,78 +131,82 @@ Knobs worth knowing:
 | `--lr` | peak learning rate |
 | `--ft-hidden` / `--hidden` | network width |
 | `--result-weight` | how much of the target comes from the game result vs. the MCTS value |
-| `--max-minutes` | hard wall-clock budget; training stops cleanly when hit |
+| `--max-minutes` | wall-clock budget; training stops cleanly when it is hit |
+
+The network is only ~300k parameters, so an A100 runs through a million
+positions in well under a second.  Training is not the bottleneck — generating
+the data was.
 """),
     code("""
-import glob, os, subprocess, sys, time
+import os, sys, time
 
-shards = find_data()
-if not shards:
-    raise SystemExit("No dataset found -- upload data/data.t*.bin or mount Drive.")
-
-pattern = shards[0].replace("data.t0.bin", "data.t*.bin")
-if not any("data.t" in s for s in shards):
-    pattern = shards[0]
-
-EPOCHS   = int(os.environ.get("EPOCHS", "12"))
+PATTERN = "data/data.t*.bin"
+EPOCHS   = int(os.environ.get("EPOCHS", "15"))
 BATCH    = int(os.environ.get("BATCH", "8192"))
 LR       = float(os.environ.get("LR", "2e-3"))
-FT       = int(os.environ.get("FT_HIDDEN", "512"))
-HIDDEN   = int(os.environ.get("HIDDEN", "256"))
+FT       = int(os.environ.get("FT_HIDDEN", "256"))
+HIDDEN   = int(os.environ.get("HIDDEN", "128"))
 MAXMIN   = float(os.environ.get("MAX_MINUTES", "0"))
+RESULTW  = float(os.environ.get("RESULT_WEIGHT", "0.25"))
 
-cmd = [sys.executable, "train/train.py",
-       "--data", pattern,
-       "--out", "runs/colab",
-       "--epochs", str(EPOCHS),
-       "--batch", str(BATCH),
-       "--lr", str(LR),
-       "--ft-hidden", str(FT),
-       "--hidden", str(HIDDEN),
-       "--max-minutes", str(MAXMIN)]
-print(" ".join(cmd))
+print(f"epochs={EPOCHS} batch={BATCH} lr={LR} ft={FT} hidden={HIDDEN} result_weight={RESULTW}")
 t0 = time.time()
-!{sys.executable} train/train.py --data "{pattern}" --out runs/colab --epochs {EPOCHS} --batch {BATCH} --lr {LR} --ft-hidden {FT} --hidden {HIDDEN} --max-minutes {MAXMIN}
-print("training took %.1f minutes" % ((time.time()-t0)/60))
+!{sys.executable} train/train.py --data "{PATTERN}" --out runs/colab \\
+    --epochs {EPOCHS} --batch {BATCH} --lr {LR} --ft-hidden {FT} --hidden {HIDDEN} \\
+    --result-weight {RESULTW} --max-minutes {MAXMIN}
+print("training took %.1f minutes" % ((time.time() - t0) / 60))
 """),
     md("""
 ## 5. Export
 
-The exported file contains the int8 weights, the per-layer scales and the
+The exported file holds the int8 weights, the per-layer scales and the
 architecture metadata.  The C++ engine reads it directly.
 """),
     code("""
 !python3 train/export_nnue.py --checkpoint runs/colab/best.pt --out /content/net.nnue
 import os
-print("net.nnue: %.2f MB" % (os.path.getsize("/content/net.nnue")/1e6))
+print("net.nnue: %.2f MB" % (os.path.getsize("/content/net.nnue") / 1e6))
+"""),
+    md("""
+## 6. Verify
+
+This proves that the PyTorch forward pass and the C++ inference produce
+identical values, so the engine plays exactly the network that was trained.
+It should print `PASS`.
 """),
     code("""
-# Download the network (about 1 MB).
+!python3 scripts/verify_nnue.py --checkpoint runs/colab/best.pt --net build/verify.nnue --positions 300
+"""),
+    md("""
+## 7. Download the network
+
+`net.nnue` is about 300 KB.  Put it in the project's `net.nnue` and you can
+run the match locally:
+
+```bash
+cd engine
+./build/match --games 400 --time 1.0 --engine-a "ab:nnue=../net.nnue" --engine-b ab
+```
+"""),
+    code("""
 from google.colab import files
 files.download("/content/net.nnue")
 """),
     md("""
-## 6. Verify (optional but recommended)
+## 8. (Optional) More self-play data on the VM
 
-This proves that the PyTorch forward pass and the C++ inference produce
-identical values, so the engine plays exactly the network that was trained.
-"""),
-    code("""
-!python3 scripts/verify_nnue.py --checkpoint runs/colab/best.pt --net build/verify.nnue --positions 200
-"""),
-    md("""
-## 7. (Optional) Generate more self-play data on the VM
-
-Colab only gives a couple of CPU cores, so this is much slower than your
-machine -- but it runs without any further upload.
+Colab only gives a couple of CPU cores, so this is much slower than a laptop
+— but it runs without any further upload, and it can be combined with the
+dataset you already have.
 
 ```bash
 cd jungle-nnue/engine
-./build/selfplay --games 200 --threads $(nproc) --sims 800 --leaf-depth 1 \\
+./build/selfplay --games 400 --threads $(nproc) --sims 800 \\
+                 --leaf-depth 1 --leaf-agg 1 --c-puct 1.4 \\
                  --out /content/more/data
 ```
 
-Download `/content/more/*.bin` and add it to the next run's dataset.
+Download `/content/more/*.bin` and add them to the next run's dataset.
 """),
 ]
 

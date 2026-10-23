@@ -95,7 +95,9 @@ def main():
         return 2
 
     tr_idx, va_idx = split_indices(n, args.val_fraction, args.seed)
-    board_t = torch.from_numpy(board.astype(np.int64))
+    # Keep the board as uint8: 63 bytes per position instead of 504.  It is
+    # widened to int64 per batch, which is where the feature indices need it.
+    board_t = torch.from_numpy(board)
     stm_t = torch.from_numpy(stm)
     result_t = torch.from_numpy(result)
     value_t = torch.from_numpy(mcts_value)
@@ -109,8 +111,8 @@ def main():
 
     # Keep everything on the GPU when it fits -- the feature construction is
     # then essentially free.
-    gpu_bytes = board.size * 8
-    if device.type == "cuda" and gpu_bytes < 6e9:
+    gpu_bytes = board.size
+    if device.type == "cuda" and gpu_bytes < 8e9:
         board_all = board_t.to(device)
         stm_all = stm_t.to(device)
         target_all = target_all.to(device)
@@ -161,12 +163,12 @@ def main():
             idx = perm[i:i + args.batch]
             if resident:
                 ti = torch.from_numpy(idx).to(device, non_blocking=True)
-                b = board_all[ti]
+                b = board_all[ti].long()
                 s = stm_all[ti]
                 y = target_all[ti]
             else:
                 ti = torch.from_numpy(idx)
-                b = board_t[ti].to(device, non_blocking=True)
+                b = board_t[ti].to(device, non_blocking=True).long()
                 s = stm_t[ti].to(device, non_blocking=True)
                 y = target_all[ti.to(device)]
 
@@ -210,9 +212,9 @@ def main():
                 ti = torch.from_numpy(idx)
                 if resident:
                     ti = ti.to(device)
-                    b, s, y = board_all[ti], stm_all[ti], target_all[ti]
+                    b, s, y = board_all[ti].long(), stm_all[ti], target_all[ti]
                 else:
-                    b = board_t[ti].to(device)
+                    b = board_t[ti].to(device).long()
                     s = stm_t[ti].to(device)
                     y = target_all[ti.to(device)]
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
