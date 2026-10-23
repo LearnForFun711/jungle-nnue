@@ -175,6 +175,7 @@ int main(int argc, char** argv) {
 
     const int threads = std::max(1, o.threads);
     std::atomic<int> a_wins{0}, b_wins{0}, draws{0}, done{0};
+    std::atomic<int> decisive_a{0}, decisive_b{0};
     std::atomic<int> end_den{0}, end_nomoves{0}, end_rep{0}, end_len{0};
     std::atomic<long long> total_plies{0};
     std::atomic<long long> total_nodes{0};
@@ -196,8 +197,8 @@ int main(int argc, char** argv) {
                 const bool a_won = (gr.result > 0) == a_is_red;
                 outcome = a_won ? 1 : -1;
             }
-            if (outcome > 0) ++a_wins;
-            else if (outcome < 0) ++b_wins;
+            if (outcome > 0) { ++a_wins; ++decisive_a; }
+            else if (outcome < 0) { ++b_wins; ++decisive_b; }
             else ++draws;
 
             switch (gr.cause) {
@@ -238,6 +239,15 @@ int main(int argc, char** argv) {
     std::printf("  \"b_wins\": %d,\n", bw);
     std::printf("  \"draws\": %d,\n", dr);
     std::printf("  \"score_a\": %.4f,\n", mean);
+    const int dec_total = decisive_a.load() + decisive_b.load();
+    if (dec_total > 0) {
+        const double dmean = double(decisive_a.load()) / double(dec_total);
+        const double dse = std::sqrt(std::max(0.0, dmean * (1.0 - dmean) / double(dec_total)));
+        std::printf("  \"decisive_games\": %d,\n", dec_total);
+        std::printf("  \"decisive_score_a\": %.4f,\n", dmean);
+        std::printf("  \"decisive_score_ci95\": [%.4f, %.4f],\n",
+                    dmean - 1.96 * dse, dmean + 1.96 * dse);
+    }
     std::printf("  \"score_ci95\": [%.4f, %.4f],\n", mean - 1.96 * se, mean + 1.96 * se);
     std::printf("  \"elo_a\": %.1f,\n", elo_from_score(mean));
     std::printf("  \"endings\": {\"den\": %d, \"no_moves\": %d, \"repetition\": %d, \"length\": %d},\n",

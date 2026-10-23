@@ -33,7 +33,7 @@ jobs:
           set -e
           # A tiny dataset is enough to prove the whole pipeline works.
           mkdir -p /tmp/ci-data
-          ./engine/build/selfplay --games 2 --threads 2 --sims 60 \
+          ./engine/build/selfplay --games 6 --threads 2 --sims 60 \
                                   --leaf-depth 1 --leaf-agg 1 \
                                   --out /tmp/ci-data/data
           python3 train/train.py --data "/tmp/ci-data/data.t*.bin" \

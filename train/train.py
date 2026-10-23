@@ -90,9 +90,11 @@ def main():
     board, stm, result, mcts_value, ply, _cause = load_shards(args.data)
     n = board.shape[0]
     print(f"  {n} positions loaded in {time.time()-t0:.1f}s", flush=True)
-    if n < 1000:
-        print("ERROR: not enough data", file=sys.stderr)
+    if n < 32:
+        print(f"ERROR: only {n} positions -- not enough to train", file=sys.stderr)
         return 2
+    if n < 1000:
+        print(f"WARNING: only {n} positions; this will not produce a usable network")
 
     tr_idx, va_idx = split_indices(n, args.val_fraction, args.seed)
     # Keep the board as uint8: 63 bytes per position instead of 504.  It is
