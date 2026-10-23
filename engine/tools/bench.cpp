@@ -22,7 +22,9 @@ double per_call(F&& f, int reps) {
 }
 
 int main(int argc, char** argv) {
-    const int reps = argc > 1 ? std::atoi(argv[1]) : 20000;
+    const int reps = argc > 2 ? std::atoi(argv[2]) : 20000;
+    // The network to benchmark; the default is the one in build/.
+    const std::string net_path = (argc > 1) ? argv[1] : "../build/net_256_128.nnue";
 
     // A mid-game position.
     Position pos;
@@ -108,26 +110,13 @@ int main(int argc, char** argv) {
     // NNUE evaluation speed.
     {
         NnueNetwork net;
-        if (nnue_load("../build/net_512_256.nnue", net)) {
+        if (nnue_load(net_path, net)) {
             const double t_nn = per_call([&] {
                 nnue_refresh(net, pos);
                 sink += int(nnue_forward(net, pos.stm) * 1000.0f);
             }, reps);
-            std::printf("nnue eval (512/256): %.3f us\n", t_nn);
-        }
-        if (nnue_load("../build/net_512_128.nnue", net)) {
-            const double t_nn = per_call([&] {
-                nnue_refresh(net, pos);
-                sink += int(nnue_forward(net, pos.stm) * 1000.0f);
-            }, reps);
-            std::printf("nnue eval (512/128): %.3f us\n", t_nn);
-        }
-        if (nnue_load("../build/net_256_128.nnue", net)) {
-            const double t_nn = per_call([&] {
-                nnue_refresh(net, pos);
-                sink += int(nnue_forward(net, pos.stm) * 1000.0f);
-            }, reps);
-            std::printf("nnue eval (256/128): %.3f us\n", t_nn);
+            std::printf("nnue eval (%d/%d) full refresh: %.3f us\n",
+                        net.ft_hidden, net.hidden, t_nn);
 
             // The path the search actually uses: the accumulators are kept up
             // to date incrementally, so an evaluation is the forward pass only.
@@ -135,7 +124,7 @@ int main(int argc, char** argv) {
             ev.net = net;
             ev.refresh(pos);
             Move first[128];
-            const int nf = generate_moves(pos, first);
+            generate_moves(pos, first);
             const Move m = first[0];
             const double t_incr = per_call([&] {
                 const int moved    = pos.board[m.from];
@@ -144,12 +133,13 @@ int main(int argc, char** argv) {
                 sink += ev.eval_cached(pos);
                 ev.on_move(m.from, m.to, moved, captured, false);
             }, reps);
-            std::printf("nnue eval (256/128) incremental: %.3f us\n", t_incr);
-            std::printf("  (legal moves at this position: %d)\n", nf);
+            std::printf("nnue eval (%d/%d) incremental : %.3f us\n",
+                        net.ft_hidden, net.hidden, t_incr);
 
-            // How long a full refresh costs on its own.
             const double t_refresh = per_call([&] { nnue_refresh(net, pos); }, reps);
-            std::printf("nnue refresh only: %.3f us\n", t_refresh);
+            std::printf("nnue refresh only            : %.3f us\n", t_refresh);
+        } else {
+            std::printf("nnue eval: could not load %s\n", net_path.c_str());
         }
     }
 

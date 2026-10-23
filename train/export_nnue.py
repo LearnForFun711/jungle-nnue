@@ -80,6 +80,81 @@ def export(model, path):
     }
 
 
+def load_nnue(path):
+    """Read a binary network back into a torch model.
+
+    Useful for checking the file the engine actually plays, rather than the
+    checkpoint it came from: if the two ever disagree, the export is wrong.
+    """
+    import torch
+    from model import JungleNNUE
+
+    with open(path, "rb") as f:
+        blob = f.read()
+
+    off = 0
+
+    def take(n):
+        nonlocal off
+        chunk = blob[off:off + n]
+        off += n
+        return chunk
+
+    magic = take(8)
+    if magic != MAGIC:
+        raise ValueError(f"{path}: not a JNNUE file")
+    version, ft_hidden, hidden, num_layers, buckets, squares = struct.unpack(
+        "<6I", take(24))
+    if version != 3:
+        raise ValueError(f"{path}: unsupported version {version}")
+    if buckets != NUM_BUCKETS or squares != NUM_SQUARES or num_layers != 2:
+        raise ValueError(f"{path}: unexpected architecture")
+
+    ft_input = NUM_SQUARES * NUM_BUCKETS
+
+    def f32(n):
+        return np.frombuffer(take(4 * n), dtype="<f4")
+
+    def i8(n):
+        return np.frombuffer(take(n), dtype=np.int8)
+
+    model = JungleNNUE(ft_hidden, hidden)
+
+    ft_w = i8(ft_input * ft_hidden).reshape(ft_input, ft_hidden).T.copy()
+    ft_scale = f32(ft_hidden).copy()
+    ft_bias = f32(ft_hidden).copy()
+    # The export folds the gain into the weights, so the file holds the
+    # effective weights; putting them back with a gain of one reproduces the
+    # forward pass exactly.
+    with torch.no_grad():
+        model.ft.weight.copy_(torch.from_numpy(
+            (ft_w.astype(np.float32) * ft_scale[:, None])))
+        model.ft.bias.copy_(torch.from_numpy(ft_bias))
+        model.ft.log_gain.zero_()
+
+        for idx, (n_out, n_in) in enumerate(
+                [(hidden, ft_hidden), (hidden, hidden)]):
+            w = i8(n_out * n_in).reshape(n_out, n_in).copy()
+            scale = f32(n_out).copy()
+            bias = f32(n_out).copy()
+            layer = model.h1 if idx == 0 else model.h2
+            layer.weight.copy_(torch.from_numpy(
+                w.astype(np.float32) * scale[:, None]))
+            layer.bias.copy_(torch.from_numpy(bias))
+            layer.log_gain.zero_()
+
+        ow = i8(2 * hidden).copy()
+        oscale = float(f32(1)[0])
+        obias = float(f32(1)[0])
+        model.out.weight.copy_(torch.from_numpy(
+            ow.astype(np.float32) * np.float32(oscale)))
+        model.out.bias.copy_(torch.tensor(np.float32(obias)))
+        model.out.log_gain.zero_()
+
+    model.eval()
+    return model
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
