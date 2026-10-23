@@ -52,13 +52,14 @@ struct GameResult {
 struct Stats { long long nodes = 0; long long depth = 0; long long moves = 0; };
 
 GameResult play_game(const Options& o, Engine& red_engine, Engine& black_engine,
-                     Stats* stats = nullptr) {
+                     Stats* red_stats = nullptr, Stats* black_stats = nullptr) {
     Position pos;
     std::vector<uint64_t> history;
     history.push_back(pos.key);
 
     while (true) {
         Engine& engine = (pos.stm == RED) ? red_engine : black_engine;
+        Stats* stats = (pos.stm == RED) ? red_stats : black_stats;
         Move m = engine.best_move(pos, history);
         if (m.from == 0xFFFF) break;
         if (stats) {
@@ -181,16 +182,20 @@ int main(int argc, char** argv) {
     std::atomic<long long> total_nodes{0};
     std::atomic<long long> total_depth{0};
     std::atomic<long long> total_moves{0};
+    std::atomic<long long> total_a_nodes{0}, total_a_depth{0}, total_a_moves{0};
+    std::atomic<long long> total_b_nodes{0}, total_b_depth{0}, total_b_moves{0};
 
     auto worker = [&](int tid) {
         Engine ea(o.a), eb(o.b);
-        Stats stats;
+        Stats a_stats, b_stats;
         for (int g = tid; g < o.games; g += threads) {
             const bool a_is_red = ((g & 1) == 0);
             Engine& red_engine   = a_is_red ? ea : eb;
             Engine& black_engine = a_is_red ? eb : ea;
 
-            GameResult gr = play_game(o, red_engine, black_engine, &stats);
+            GameResult gr = play_game(o, red_engine, black_engine,
+                                       a_is_red ? &a_stats : &b_stats,
+                                       a_is_red ? &b_stats : &a_stats);
             int outcome;   // from A's point of view
             if (gr.result == 0) outcome = 0;
             else {
@@ -208,9 +213,15 @@ int main(int argc, char** argv) {
                 default: ++end_len; break;
             }
             total_plies += gr.plies;
-            total_nodes += stats.nodes;
-            total_depth += stats.depth;
-            total_moves += stats.moves;
+            total_nodes += a_stats.nodes + b_stats.nodes;
+            total_depth += a_stats.depth + b_stats.depth;
+            total_moves += a_stats.moves + b_stats.moves;
+            total_a_nodes += a_stats.nodes;
+            total_a_depth += a_stats.depth;
+            total_a_moves += a_stats.moves;
+            total_b_nodes += b_stats.nodes;
+            total_b_depth += b_stats.depth;
+            total_b_moves += b_stats.moves;
 
             const int d = ++done;
             if (d % 20 == 0 || d == o.games) {
@@ -257,6 +268,14 @@ int main(int argc, char** argv) {
                 double(total_nodes.load()) / std::max(1LL, total_moves.load()));
     std::printf("  \"avg_depth\": %.2f,\n",
                 double(total_depth.load()) / std::max(1LL, total_moves.load()));
+    // Per-engine numbers: this is what shows whether one side is handicapped
+    // by a slower evaluation (fewer nodes per move at the same clock).
+    std::printf("  \"speed_a\": {\"avg_nodes_per_move\": %.0f, \"avg_depth\": %.2f},\n",
+                double(total_a_nodes.load()) / std::max(1LL, total_a_moves.load()),
+                double(total_a_depth.load()) / std::max(1LL, total_a_moves.load()));
+    std::printf("  \"speed_b\": {\"avg_nodes_per_move\": %.0f, \"avg_depth\": %.2f},\n",
+                double(total_b_nodes.load()) / std::max(1LL, total_b_moves.load()),
+                double(total_b_depth.load()) / std::max(1LL, total_b_moves.load()));
     std::printf("  \"time_limit\": %.4f,\n", o.time_limit);
     std::printf("  \"node_limit\": %llu\n", (unsigned long long)o.node_limit);
     std::printf("}\n");
