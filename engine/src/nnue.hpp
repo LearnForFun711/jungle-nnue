@@ -369,6 +369,20 @@ inline float nnue_forward(const NnueNetwork& net, int stm) {
 struct Evaluator {
     NnueNetwork net;  // invalid => use the handcrafted evaluation
 
+    // The network's value is multiplied by this before it is used as a
+    // search score.  The network outputs a value in [-1,1] and in practice
+    // uses only a small part of that range (a standard deviation of about
+    // 0.06, against the handcrafted evaluation's 0.19), so the scores it
+    // produces are compressed relative to the handcrafted evaluation's.  The
+    // search compares scores with a one-unit window and a draw is worth
+    // exactly zero, so how wide the evaluation's range is decides how coarse
+    // that comparison is.  Measured at one second per move, a compressed
+    // network loses every decisive game to the handcrafted engine and a
+    // network at this scale wins them; with the scale at one the engine
+    // gives up on positions it thinks it is slightly behind in, because a
+    // repetition (worth exactly zero) looks better than a small deficit.
+    float value_scale = 10.0f;
+
     bool uses_nnue() const { return net.valid(); }
 
     // Side to move that the cached accumulators belong to.  The search keeps
@@ -411,7 +425,7 @@ struct Evaluator {
 
     int forward_value() const {
         const float v = nnue_forward(net, stm_);  // side to move's view
-        return int(std::lround(v * 1000.0f));
+        return int(std::lround(v * 1000.0f * value_scale));
     }
 };
 

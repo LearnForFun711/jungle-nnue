@@ -23,6 +23,7 @@ struct EngineConfig {
 
     bool   use_nnue = false;
     std::string nnue_path;
+    float  nnue_scale = 10.0f;  // multiplies the network's value
 
     // alpha-beta
     double time_limit = 1.0;   // seconds per move
@@ -44,6 +45,7 @@ class Engine {
 public:
     explicit Engine(const EngineConfig& cfg)
         : cfg_(cfg) {
+        ev_.value_scale = cfg_.nnue_scale;
         if (cfg_.use_nnue && !cfg_.nnue_path.empty()) {
             if (!nnue_load(cfg_.nnue_path, ev_.net)) {
                 ev_.net = NnueNetwork();

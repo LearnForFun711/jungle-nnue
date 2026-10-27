@@ -293,17 +293,6 @@ files.download(zip_path)
 The shards the background generator produced are worth keeping: they are
 teacher data for the *next* iteration.  The cell below packs them and stops
 the generator.
-
-To start the expert-iteration round -- the network becomes the teacher's leaf
-evaluation, so the teacher's data improves, so the next network is better --
-run this after the download:
-
-```bash
-cd engine
-./build/selfplay --games 2000 --threads $(nproc) --sims 800 \\
-                 --nnue ../net.nnue --leaf-depth 1 --leaf-agg 1 \\
-                 --out /content/round2/data
-```
 """),
     code("""
 import glob, os, subprocess, tarfile
@@ -319,6 +308,42 @@ if shards:
     print("packed /content/jungle-dataset-round2.tar.gz")
     from google.colab import files
     files.download("/content/jungle-dataset-round2.tar.gz")
+"""),
+    md("""
+## 10. (Optional) Start the expert-iteration round
+
+This is the self-play reinforcement loop.  The network you have just trained
+becomes the MCTS teacher's leaf evaluation, so the teacher's values are now
+the network's values plus a search on top of them, the data generated from
+them is better than the data the network was trained on, and the next
+network trained on that data is better than this one.
+
+The ground truth that keeps the loop honest is the *result of the game*, not
+the teacher's value: the teacher's value is a noisy estimate of a position's
+value, and if the teacher's leaf is the network then the teacher's value
+starts chasing its own tail.  The result of the game does not.  That is why
+the training target blends the two (`--result-weight`).
+
+Run this cell to generate the next round's data.  It runs in the background
+for `ROUND2_MINUTES` minutes; the shards appear under `data/round2/`.
+"""),
+    code("""
+import os, subprocess, time
+
+ROUND2_MINUTES = int(os.environ.get("ROUND2_MINUTES", "480"))
+NET = "/content/net.nnue"
+
+if not os.path.exists(NET):
+    raise SystemExit("no trained network at %s -- run the training cell first" % NET)
+
+os.makedirs("data/round2", exist_ok=True)
+proc = subprocess.Popen(
+    ["bash", "scripts/expert_iteration.sh", NET, str(ROUND2_MINUTES),
+     "data/round2/data"],
+    stdout=open("round2.log", "w"), stderr=subprocess.STDOUT)
+print("expert iteration started (pid %d), log: round2.log" % proc.pid)
+time.sleep(5)
+print(open("round2.log").read()[-800:])
 """),
 ]
 

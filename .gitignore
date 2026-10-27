@@ -1,5 +1,6 @@
 # build artefacts
 engine/build/
+engine/build*/
 build/
 *.o
 *.so

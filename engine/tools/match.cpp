@@ -94,7 +94,7 @@ double elo_from_score(double s) {
 }
 
 EngineConfig parse_engine(const std::string& spec, const Options& o) {
-    // spec: "ab" (alpha-beta) | "mcts" | "mcts:1600" | "ab@nnue=path"
+    // spec: "ab" | "mcts" | "mcts:1600:cpuct=1.5" | "ab:nnue=path:scale=3.4"
     EngineConfig c;
     c.time_limit = o.time_limit;
     c.node_limit = o.node_limit;
@@ -106,34 +106,50 @@ EngineConfig parse_engine(const std::string& spec, const Options& o) {
         kind = spec.substr(0, colon);
         rest = spec.substr(colon + 1);
     }
+
+    // The option list after the engine kind, as key/value pairs.
+    struct Opt { std::string key; std::string value; bool has_value; };
+    std::vector<Opt> opts;
+    {
+        std::stringstream ss(rest);
+        std::string tok;
+        while (std::getline(ss, tok, ':')) {
+            if (tok.empty()) continue;
+            const size_t eq = tok.find('=');
+            if (eq == std::string::npos) opts.push_back({tok, std::string(), false});
+            else opts.push_back({tok.substr(0, eq), tok.substr(eq + 1), true});
+        }
+    }
+
     if (kind == "mcts" || kind == "m") {
         c.kind = EngineConfig::MCTS;
-        // "mcts:<sims>[:key=value ...]"
-        std::string head = rest, tail;
-        const size_t colon2 = rest.find(':');
-        if (colon2 != std::string::npos) { head = rest.substr(0, colon2); tail = rest.substr(colon2 + 1); }
-        if (!head.empty()) c.mcts_sims = std::stoi(head);
-        std::string tok;
-        std::stringstream ss(tail);
-        while (std::getline(ss, tok, ':')) {
-            const size_t eq = tok.find('=');
-            if (eq == std::string::npos) continue;
-            const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
-            if (k == "cpuct") c.mcts_c_puct = std::stod(v);
-            else if (k == "leaf") c.mcts_leaf_depth = std::stoi(v);
-            else if (k == "widen") c.mcts_widening = std::stod(v);
-            else if (k == "agg") c.mcts_leaf_agg = std::stoi(v);
+        // The first bare token is the simulation count.
+        bool first = true;
+        for (const Opt& op : opts) {
+            if (first && !op.has_value) {
+                c.mcts_sims = std::stoi(op.key);
+                first = false;
+                continue;
+            }
+            first = false;
+            if (op.key == "cpuct") c.mcts_c_puct = std::stod(op.value);
+            else if (op.key == "leaf") c.mcts_leaf_depth = std::stoi(op.value);
+            else if (op.key == "widen") c.mcts_widening = std::stod(op.value);
+            else if (op.key == "agg") c.mcts_leaf_agg = std::stoi(op.value);
+            else if (op.key == "nnue") { c.use_nnue = true; c.nnue_path = op.value; }
+            else if (op.key == "scale") c.nnue_scale = std::stof(op.value);
         }
-    } else {
-        c.kind = EngineConfig::ALPHABETA;
+        return c;
     }
-    if (rest.find("nnue=") != std::string::npos) {
-        const size_t p = rest.find("nnue=");
-        c.use_nnue = true;
-        c.nnue_path = rest.substr(p + 5);
-    } else if (kind.find("nnue") != std::string::npos) {
-        c.use_nnue = true;
-        c.nnue_path = o.a.nnue_path;
+
+    c.kind = EngineConfig::ALPHABETA;
+    for (const Opt& op : opts) {
+        if (op.key == "nnue") {
+            c.use_nnue = true;
+            c.nnue_path = op.has_value ? op.value : o.a.nnue_path;
+        } else if (op.key == "scale") {
+            c.nnue_scale = std::stof(op.value);
+        }
     }
     return c;
 }

@@ -175,18 +175,40 @@ private:
     // Depth 1 is the sweet spot: it costs about one move generation per
     // leaf but makes the teacher's values far more informative than the raw
     // static evaluation, which is what the network has to learn from.
-    double leaf_value(const Position& pos) {
+    // Base evaluation of a position in [-1,1], from the side to move's point
+    // of view.
+    //
+    // When a network is loaded it *replaces* the handcrafted evaluation, but
+    // it does not replace the structure of the leaf search: the one-ply
+    // averaging below still runs, so the teacher still gets to look one move
+    // ahead and to average away the noise of a single static evaluation.
+    // That is the difference between a teacher whose values are worth
+    // learning from and one that merely echoes the network it was given.
+    double base_eval(const Position& pos) {
         if (p_.use_nnue && ev_ && ev_->uses_nnue()) {
             const float v = float(ev_->eval(pos)) / 1000.0f * float(p_.leaf_scale);
             return double(std::max(-1.0f, std::min(1.0f, v)));
         }
+        return normalise(evaluate(pos));
+    }
+
+    // The same, but for a position the accumulators already describe.
+    double base_eval_cached(const Position& pos) {
+        if (p_.use_nnue && ev_ && ev_->uses_nnue()) {
+            const float v = float(ev_->eval_cached(pos)) / 1000.0f * float(p_.leaf_scale);
+            return double(std::max(-1.0f, std::min(1.0f, v)));
+        }
+        return normalise(evaluate(pos));
+    }
+
+    double leaf_value(const Position& pos) {
         if (p_.rollouts > 0) {
             double sum = 0.0;
             for (int i = 0; i < p_.rollouts; ++i) sum += rollout(pos);
             return std::max(-1.0, std::min(1.0, sum / p_.rollouts));
         }
         if (p_.leaf_depth <= 0)
-            return normalise(evaluate(pos));
+            return base_eval(pos);
 
         Move moves[128];
         const int n = generate_moves(pos, moves);
@@ -196,20 +218,43 @@ private:
             // Averaging the children's evaluations keeps the value
             // discriminative; taking the maximum of ~30 noisy evaluations
             // would bias every position towards zero.
+            const bool neural = p_.use_nnue && ev_ && ev_->uses_nnue();
             double sum = 0.0;
+            double best = neural ? -1.0 : double(-MATE_SCORE);
             int count = 0;
-            int best = -MATE_SCORE;
+
+            // One refresh for the parent; the children are then reached by
+            // moving a single piece, which the feature accumulator can
+            // follow incrementally.  Refreshing for every child instead
+            // makes the teacher four times slower for the same data.
+            if (neural) ev_->refresh(pos);
+
             for (int i = 0; i < n; ++i) {
                 if (terrain().den_owner[moves[i].to] == opposite_color(pos.stm))
                     return 1.0;
+                const int moved    = pos.board[moves[i].from];
+                const int captured = pos.board[moves[i].to];
                 Position child = pos;
                 make_move(child, moves[i]);
-                const int v = -evaluate(child);
-                best = std::max(best, v);
-                sum += v;
+                if (neural) {
+                    ev_->on_move(moves[i].from, moves[i].to, moved, captured, true);
+                    // The network's value is already in [-1,1], so it is
+                    // aggregated directly and never normalised.
+                    const double v = -base_eval_cached(child);
+                    ev_->on_move(moves[i].from, moves[i].to, moved, captured, false);
+                    sum += v;
+                    best = std::max(best, v);
+                } else {
+                    const int v = -evaluate(child);
+                    best = std::max(best, double(v));
+                    sum += v;
+                }
                 ++count;
             }
-            const int agg = (p_.leaf_agg == 0) ? best : int(std::lround(sum / count));
+            if (neural)
+                return (p_.leaf_agg == 0) ? best : sum / count;
+            const int agg = (p_.leaf_agg == 0) ? int(std::lround(best))
+                                               : int(std::lround(sum / count));
             return normalise(agg);
         }
         Position work = pos;
