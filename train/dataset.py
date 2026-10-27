@@ -21,8 +21,15 @@ RESULT_CODES = {0: -1.0, 1: 0.0, 2: 1.0}
 
 
 def load_shards(pattern):
-    """Load every shard matching ``pattern`` into flat numpy arrays."""
-    files = sorted(glob.glob(pattern))
+    """Load every shard matching ``pattern`` into flat numpy arrays.
+
+    The pattern is matched recursively, so ``data/**/*.bin`` picks up the
+    shards of every round of data generation, not just the ones in the
+    top-level directory.  Shards that hold a policy target rather than a
+    value are skipped: they are not in this format.
+    """
+    files = sorted(glob.glob(pattern, recursive=True))
+    files = [p for p in files if "policy" not in os.path.basename(p)]
     if not files:
         raise FileNotFoundError(f"no shards matched {pattern!r}")
 

@@ -183,7 +183,55 @@ time.sleep(5)
 print(open("selfplay.log").read()[-800:])
 """),
     md("""
-## 5. Train -- eight hours of it
+## 5. Train a quick first network, and put it in the teacher
+
+The teacher's values are what the network learns from, and they are only as
+good as the evaluation the teacher searches with.  With the handcrafted
+evaluation the teacher's value correlates with the result of the game by
+about 0.14 -- barely better than nothing -- so the data it produces is
+mostly a noisy version of "who won".  That is the real bottleneck of this
+project, and no amount of GPU time fixes it.
+
+A network is a much better leaf evaluation than the handcrafted one, so the
+fix is to train a small network first, plug it into the teacher, and let the
+generator spend the rest of the session producing data from it.  That is the
+expert-iteration loop, and starting it half an hour into the session instead
+of after it is worth a lot of data quality.
+
+This cell trains a small network for `PRETRAIN_MINUTES` minutes (a couple of
+dozen on an A100 is plenty -- it only has to be good enough to be a better
+leaf), exports it, and restarts the generator with it as the teacher's leaf.
+"""),
+    code("""
+import os, subprocess, sys, time
+
+PRETRAIN_MINUTES = int(os.environ.get("PRETRAIN_MINUTES", "20"))
+FIRST_NET = "/content/net-first.nnue"
+os.makedirs("data/round1", exist_ok=True)
+
+print("training the first network for %d minutes ..." % PRETRAIN_MINUTES)
+!{sys.executable} train/train.py --data "data/**/*.bin" \\
+    --out runs/first --budget-minutes {PRETRAIN_MINUTES} \\
+    --batch 8192 --lr 2e-3 --ft-hidden 96 --hidden 48 --result-weight 0.25
+!{sys.executable} train/export_nnue.py --checkpoint runs/first/best.pt \\
+    --out {FIRST_NET}
+print("first network written to", FIRST_NET)
+
+# Restart the generator with the network as the teacher's leaf.
+subprocess.run(["pkill", "-f", "selfplay_loop.sh"])
+time.sleep(2)
+os.makedirs("data/round1", exist_ok=True)
+proc = subprocess.Popen(
+    ["bash", "scripts/expert_iteration.sh", FIRST_NET, str(SELFPLAY_MINUTES),
+     "data/round1/data"],
+    stdout=open("round1.log", "w"), stderr=subprocess.STDOUT)
+print("generator restarted with the network as the teacher's leaf (pid %d),"
+      " log: round1.log" % proc.pid)
+time.sleep(5)
+print(open("round1.log").read()[-800:])
+"""),
+    md("""
+## 6. Train -- eight hours of it
 
 The whole training budget is one number.  `train/train_budget.py` splits it
 across several network shapes; each run gets a slice, trains on whatever data
@@ -210,19 +258,19 @@ candidate is exported so they can be compared by playing strength.
 import os, sys, time
 
 BUDGET_MINUTES = int(os.environ.get("BUDGET_MINUTES", "480"))   # eight hours
-CONFIGS        = os.environ.get("CONFIGS", "96:48:0.25,128:64:0.35,256:128:0.25")
+CONFIGS        = os.environ.get("CONFIGS", "96:48:0.25,96:48:0.50,96:48:0.75,128:64:0.50,256:128:0.50")
 BATCH          = int(os.environ.get("BATCH", "8192"))
 LR             = float(os.environ.get("LR", "2e-3"))
 
 print(f"budget={BUDGET_MINUTES} min  configs={CONFIGS}  batch={BATCH}  lr={LR}")
 t0 = time.time()
-!{sys.executable} train/train_budget.py --data "data/data.t*.bin" \\
+!{sys.executable} train/train_budget.py --data "data/**/*.bin" \\
     --out runs/budget --minutes {BUDGET_MINUTES} --configs "{CONFIGS}" \\
     --batch {BATCH} --lr {LR} --best-out /content/net.nnue
 print("training took %.1f minutes" % ((time.time() - t0) / 60))
 """),
     md("""
-## 6. Export
+## 7. Export
 
 The exported file holds the int8 weights, the per-layer scales and biases,
 and the architecture metadata.  The C++ engine reads it directly.
@@ -248,7 +296,7 @@ print("best net:", "/content/net.nnue",
       "%.2f MB" % (os.path.getsize("/content/net.nnue") / 1e6) if os.path.exists("/content/net.nnue") else "MISSING")
 """),
     md("""
-## 7. Verify
+## 8. Verify
 
 This proves that the PyTorch forward pass and the C++ inference produce
 identical values, so the engine plays exactly the network that was trained.
@@ -262,7 +310,7 @@ for ck in sorted(glob.glob("runs/budget/*/best.pt")):
     os.system(f"./engine/build/nnue_check /content/net.nnue 5 60")
 """),
     md("""
-## 8. Download the network
+## 9. Download the network
 
 `net.nnue` is about 300 KB.  Put it in the project's `net.nnue` and you can
 run the match locally:
@@ -288,7 +336,7 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
 files.download(zip_path)
 """),
     md("""
-## 9. (Optional) Take the data with you, and start the next round
+## 10. (Optional) Take the data with you, and start the next round
 
 The shards the background generator produced are worth keeping: they are
 teacher data for the *next* iteration.  The cell below packs them and stops
@@ -310,7 +358,7 @@ if shards:
     files.download("/content/jungle-dataset-round2.tar.gz")
 """),
     md("""
-## 10. (Optional) Start the expert-iteration round
+## 11. (Optional) Start the expert-iteration round
 
 This is the self-play reinforcement loop.  The network you have just trained
 becomes the MCTS teacher's leaf evaluation, so the teacher's values are now

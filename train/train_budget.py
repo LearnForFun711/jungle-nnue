@@ -46,7 +46,9 @@ def parse_configs(spec):
 def count_positions(data_glob):
     """Count the positions in the shards the glob matches (68 bytes each)."""
     total = 0
-    for path in sorted(glob.glob(data_glob)):
+    for path in sorted(glob.glob(data_glob, recursive=True)):
+        if "policy" in os.path.basename(path):
+            continue
         total += os.path.getsize(path) // 68
     return total
 
