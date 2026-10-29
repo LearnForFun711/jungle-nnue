@@ -87,8 +87,11 @@ inline int evaluate(const Position& pos) {
         ref.sq = s; ref.piece = p; ref.color = c; ref.type = piece_type(p);
     }
 
-    if (n_mine == 0) return -30000;
-    if (n_theirs == 0) return 30000;
+    // A side with no pieces has no legal move.  It is scored the same way
+    // the search scores "no legal move", so that the two agree on how bad
+    // it is -- and so that it is not mistaken for a mate.
+    if (n_mine == 0) return -STUCK_SCORE;
+    if (n_theirs == 0) return STUCK_SCORE;
 
     int score = 0;
 

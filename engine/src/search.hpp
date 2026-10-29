@@ -35,6 +35,12 @@ struct SearchLimits {
     int      max_depth = 64;
     double   time_limit = 0.0;    // seconds; 0 => unlimited
     uint64_t node_limit = 0;      // 0 => unlimited
+
+    // Moves the search must not play.  The web front end needs this: it
+    // knows the history of the game and can rule out a move that would
+    // repeat a position, and the engine has no way of knowing that on its
+    // own.
+    const std::vector<Move>* banned = nullptr;
 };
 
 struct SearchResult {
@@ -43,6 +49,13 @@ struct SearchResult {
     int    depth = 0;
     uint64_t nodes = 0;
     double time = 0.0;
+
+    // Diagnostics: how many nodes the last completed iteration cost, and how
+    // many the aborted one burned.  When the aborted iteration costs more
+    // than the completed one, the search is spending its budget on a depth
+    // it never finishes.
+    uint64_t nodes_last_iteration = 0;
+    uint64_t nodes_aborted = 0;
 };
 
 class Searcher {
@@ -65,6 +78,7 @@ public:
         nodes_ = 0;
         aborted_ = false;
         history_ = &history;
+        banned_ = limits.banned;
 
         // Bring the NNUE feature accumulators in line with the root
         // position; from here on they are maintained incrementally by
@@ -77,10 +91,16 @@ public:
         int alpha = -MATE_SCORE - 1, beta = MATE_SCORE + 1;
         Move last_best{0xFFFF, 0xFFFF};
 
+        uint64_t nodes_before_iteration = 0;
         for (int depth = 1; depth <= limits.max_depth; ++depth) {
             const int prev_alpha = alpha;
+            nodes_before_iteration = nodes_;
             int score = alphabeta(pos, depth, alpha, beta, 0);
-            if (aborted_) break;
+            if (aborted_) {
+                best.nodes_aborted = nodes_ - nodes_before_iteration;
+                break;
+            }
+            best.nodes_last_iteration = nodes_ - nodes_before_iteration;
 
             if (score > alpha) {
                 alpha = score;
@@ -159,6 +179,20 @@ private:
         });
     }
 
+    // Remove the moves the caller has ruled out.  Returns the new count.
+    int filter_banned(Move* moves, int n) const {
+        if (!banned_ || banned_->empty()) return n;
+        int k = 0;
+        for (int i = 0; i < n; ++i) {
+            bool drop = false;
+            for (const Move& b : *banned_) {
+                if (b.from == moves[i].from && b.to == moves[i].to) { drop = true; break; }
+            }
+            if (!drop) moves[k++] = moves[i];
+        }
+        return k;
+    }
+
     // --- Core ------------------------------------------------------------
     int alphabeta(Position& pos, int depth, int alpha, int beta, int ply) {
         ++nodes_;
@@ -201,8 +235,9 @@ private:
         }
 
         Move moves[128];
-        const int n = generate_moves(pos, moves);
-        if (n == 0) return -MATE_SCORE + ply;   // no legal move: loss
+        int n = generate_moves(pos, moves);
+        n = filter_banned(moves, n);
+        if (n == 0) return -STUCK_SCORE + ply;  // no legal move: a big loss, not a mate
 
         ScoredMove ordered[128];
         order_moves(pos, moves, n, tt_from, tt_to, ordered);
@@ -279,7 +314,8 @@ private:
         if (stand > alpha) alpha = stand;
 
         Move moves[128];
-        const int n = generate_moves(pos, moves);
+        int n = generate_moves(pos, moves);
+        n = filter_banned(moves, n);
         ScoredMove ordered[128];
         order_moves(pos, moves, n, 0xFFFF, 0xFFFF, ordered);
 
@@ -314,6 +350,7 @@ private:
     bool     aborted_ = false;
     Move     root_best_{0xFFFF, 0xFFFF};
     std::vector<uint64_t>* history_ = nullptr;
+    const std::vector<Move>* banned_ = nullptr;
 };
 
 }  // namespace jungle

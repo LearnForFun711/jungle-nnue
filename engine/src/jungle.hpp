@@ -43,6 +43,17 @@ constexpr int NUM_SQ = WIDTH * HEIGHT;  // 63
 
 constexpr int MATE_SCORE = 30000;
 
+// The side to move has no legal move, so it loses -- but the opponent
+// usually has to work for that, so it is not a mate.  It used to be scored
+// as one, and that had two consequences.  The iterative deepening stops as
+// soon as the search finds a mate score, so the search gave up thinking
+// several plies early.  And the two engines disagreed about how bad it
+// is: the handcrafted evaluation returns -30000 for a side with no pieces,
+// while the network returns about -120, so the network engine was content
+// to take a repetition (worth exactly zero) rather than fight for its
+// pieces.  Scoring it the same way for both engines fixes both.
+constexpr int STUCK_SCORE = 20000;
+
 constexpr int RED   = 0;
 constexpr int BLACK = 1;
 

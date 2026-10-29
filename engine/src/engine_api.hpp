@@ -67,12 +67,16 @@ public:
         }
     }
 
-    Move best_move(Position& pos, std::vector<uint64_t>& history) {
+    // `banned` holds moves the search must not play (the caller may know
+    // something about the game's history that the engine does not).
+    Move best_move(Position& pos, std::vector<uint64_t>& history,
+                   const std::vector<Move>* banned = nullptr) {
         if (cfg_.kind == EngineConfig::ALPHABETA) {
             SearchLimits limits;
             limits.time_limit = cfg_.time_limit;
             limits.node_limit = cfg_.node_limit;
             limits.max_depth = 64;
+            limits.banned = banned;
             SearchResult r = searcher_->search(pos, limits, history);
             last_nodes_ = r.nodes;
             last_depth_ = r.depth;

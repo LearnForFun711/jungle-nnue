@@ -265,7 +265,7 @@ private:
     int leaf_search(Position& pos, int depth, int alpha, int beta) {
         Move moves[128];
         const int n = generate_moves(pos, moves);
-        if (n == 0) return -MATE_SCORE;
+        if (n == 0) return -STUCK_SCORE;
         if (depth <= 0) return evaluate(pos);
 
         // Order by a cheap heuristic so that alpha-beta cuts early.
