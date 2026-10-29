@@ -54,6 +54,14 @@ constexpr int MATE_SCORE = 30000;
 // pieces.  Scoring it the same way for both engines fixes both.
 constexpr int STUCK_SCORE = 20000;
 
+// A score at least this large is a mate.  The score of a mate is
+// MATE_SCORE - ply - 1, so a mate found three plies down scores 29997 and
+// is *not* caught by a check against MATE_SCORE - 1.  The search then spent
+// its whole budget proving the same mate over and over, which is why more
+// time per move made the search reach a *smaller* depth: the iterations
+// after the mate was found were all wasted.
+constexpr int MATE_THRESHOLD = MATE_SCORE - 128;
+
 constexpr int RED   = 0;
 constexpr int BLACK = 1;
 

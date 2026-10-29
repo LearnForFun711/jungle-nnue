@@ -197,3 +197,54 @@ clipped to [0,127], the *magnitude* of the weights decides where they land,
 and the magnitude needed differs by five orders of magnitude between the
 feature transformer (whose input is binary) and the output layer.  Each layer
 therefore carries a learnable gain, folded into the weights at export time.
+
+## A side with no legal move is not a mate
+
+This one cost more playing strength than anything the network did.
+
+The search scored "the side to move has no legal move" as a mate.  In this
+game that is a loss, but it is usually a loss the opponent has to work
+several moves for, and the two consequences of scoring it as a mate were
+both fatal.
+
+The first was mechanical: the iterative deepening stops as soon as it finds
+a mate score, so the search gave up several plies early.  The symptom was
+that *more time made the search weaker*.  The depth reached fell from 16.9
+at 0.1 seconds per move to 11.9 at 1 second, while the node count went up
+sevenfold — the opposite of what a longer clock should do.
+
+The second was that the two engines disagreed about how bad the position
+is.  The handcrafted evaluation returns -30000 for a side with no pieces,
+which is a mate-sized score; the network returns about -120, which is
+nothing at all next to a repetition worth exactly zero.  The network
+engine was therefore content to take a draw rather than fight for its
+pieces, and the handcrafted engine was not.
+
+Both now score it the same way: a very large loss, but below the mate
+score, so the search keeps thinking and the two engines agree on how bad it
+is.  At 0.1 seconds per move the score against the handcrafted engine went
+from 0.438 to 0.667 and the depth from 14.9 to 16.9.
+
+## The network's value is compressed, and the search notices
+
+The network's value is defined on [-1,1] and uses about a tenth of it: its
+standard deviation over real positions is 0.06, against the handcrafted
+evaluation's 0.19.  The search compares scores with a one-unit window and a
+repetition is worth exactly zero, so a compressed evaluation reads "slightly
+behind" where a wide one reads "clearly behind" — and the engine gives up on
+positions it thinks it is only slightly losing in.  The value is multiplied
+by ten before it is used as a search score, and the multiplier is a command
+line option so it can be tuned per network.
+
+## The teacher is only as good as its leaf
+
+The teacher's values correlate with the result of the game by about 0.14,
+whether the leaf is the handcrafted evaluation or a network.  The network's
+own value correlates by 0.36.  So the teacher dilutes the signal it is
+given: the search averages the values of the children, and that average is
+worse than the network's own opinion of the position.
+
+This is the ceiling of the whole project.  More GPU time does not raise it.
+What raises it is a network that predicts the outcome better, and the
+training target blends the teacher's value with the result of the game for
+exactly that reason — the result is the only ground truth there is.

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include "eval.hpp"
@@ -78,6 +79,10 @@ public:
         nodes_ = 0;
         aborted_ = false;
         history_ = &history;
+        // The root's best move belongs to this search: the member survives
+        // between moves, and a move from the previous position is not a
+        // move in this one.
+        root_best_ = Move{0xFFFF, 0xFFFF};
         banned_ = limits.banned;
 
         // Bring the NNUE feature accumulators in line with the root
@@ -110,7 +115,10 @@ public:
             best.depth = depth;
             if (last_best.from != 0xFFFF) best.move = last_best;
 
-            if (std::abs(score) >= MATE_SCORE - 1) break;   // mate found
+            // A mate anywhere in the tree is worth stopping for: the score
+            // of a mate is MATE_SCORE - ply - 1, so the threshold has to
+            // allow for the mate being several plies deep.
+            if (std::abs(score) >= MATE_THRESHOLD) break;   // mate found
             if (limits.time_limit > 0.0 && out_of_time()) break;
             if (alpha >= beta) { beta = MATE_SCORE + 1; alpha = prev_alpha; }
         }
@@ -254,6 +262,14 @@ private:
             if (terrain().den_owner[m.to] == opposite_color(pos.stm)) {
                 best = MATE_SCORE - ply - 1;
                 best_move = m;
+                // The root's best move has to be recorded here as well.
+                // The search takes the move it returns from root_best_,
+                // and root_best_ was only ever set on the other path
+                // through this loop, so a mate found here was reported
+                // with the score of a mate and played with whatever move
+                // the *previous* turn had preferred -- a move that can be
+                // illegal in the current position.
+                if (ply == 0) root_best_ = m;
                 break;
             }
 

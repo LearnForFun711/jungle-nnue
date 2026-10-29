@@ -129,6 +129,18 @@ class Model7AI(Model5AI):
             return super().get_move(engine, max_time)
 
         move = {'from': [fr, fc], 'to': [tr, tc]}
+        # Safety net: the front end's rules have the last word.  If the
+        # engine's move is not one of them, take a legal one instead --
+        # a move the rules reject would leave the game stuck.
+        legal = {(tuple(m['from']), tuple(m['to'])) for m in engine.get_valid_moves()}
+        if ((fr, fc), (tr, tc)) not in legal:
+            print(f"Model 7: the engine's move {move} is not legal here, "
+                  "picking a legal one instead")
+            for candidate in engine.get_valid_moves():
+                move = candidate
+                break
+            if move is None:
+                return None
         engine.last_eval = out_move[2]
         print(f"Model 7 (neural): {time_ms}ms  move {move}  score {out_move[2]}  "
               f"nodes {out_move[3]}  banned {banned_cnt}")
@@ -136,7 +148,12 @@ class Model7AI(Model5AI):
 
     # -- helpers -----------------------------------------------------------
     def _repeating_moves(self, engine):
-        """Moves whose result would repeat a position already seen twice."""
+        """Moves whose result would repeat a position already seen twice.
+
+        The engine's C API counts squares, not rows and columns, so the
+        pairs are converted: a move from (row, column) is the square
+        ``row * 7 + column``.
+        """
         banned = []
         try:
             moves = engine.get_valid_moves()
@@ -156,7 +173,7 @@ class Model7AI(Model5AI):
             board[fr][fc] = piece
             board[tr][tc] = target
             if engine.history.count(h) >= 2:
-                banned.extend([fr, fc, tr, tc])
+                banned.extend([fr * 7 + fc, tr * 7 + tc])
         return banned
 
     def _serialize_board(self, board_2d):
