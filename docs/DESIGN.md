@@ -248,3 +248,46 @@ This is the ceiling of the whole project.  More GPU time does not raise it.
 What raises it is a network that predicts the outcome better, and the
 training target blends the teacher's value with the result of the game for
 exactly that reason — the result is the only ground truth there is.
+
+## The search found mates it did not play
+
+The search returns its move through `root_best_`, a member that remembers the
+best move at the root.  It was set on one path through the move loop and not
+on the other, so a mate found the other way — a piece that can step into the
+opponent's den — set the *score* to a mate and left `root_best_` holding
+whatever move the previous turn preferred.
+
+So the engine would report a mate and play a stale move, which could be
+illegal in the current position.  In the games this looked like the neural
+engine making illegal moves and the game getting stuck; in the match harness
+it looked like the engine throwing away wins it had already found: no game
+in the four hundred game match ended with a piece entering the opponent's
+den, because every one of those mates was found and then not played.
+
+Two things had to be fixed: the root's best move is recorded on both paths,
+and it is reset at the start of every search, because a move belongs to the
+position it was found in.
+
+## A mate three plies down is still a mate
+
+The score of a mate is `MATE_SCORE - ply - 1`, so a mate found three plies
+down scores 29997 rather than 29999.  The iterative deepening stopped when
+`abs(score) >= MATE_SCORE - 1`, so it did not stop for that mate: the search
+spent its entire time budget proving the same mate over and over.
+
+That is why *more time made the search weaker*.  The depth reached fell from
+16.9 at 0.1 seconds per move to 11.9 at 1 second, while the node count went
+up sevenfold.  The iterations after the mate was found were all wasted, and
+the more time there was, the more of them there were.  The threshold now
+allows for a mate at any depth.
+
+With the two search bugs fixed and the value scaled, the same network that
+lost every decisive game at one second per move wins them:
+
+| seconds per move | before | after |
+|---|---|---|
+| 0.1 | 3 W / 6 L / 15 D | **12 W / 0 L / 12 D** |
+| 0.3 | 0 W / 1 L / 23 D | **17 W / 0 L / 7 D** |
+
+and the games are now won by entering the opponent's den, which is how the
+game is supposed to be won.
