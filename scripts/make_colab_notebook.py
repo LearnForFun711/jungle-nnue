@@ -130,7 +130,7 @@ for s in shards[:5]:
     print("  ", s, "%.1f MB" % (os.path.getsize(s) / 1e6))
 if not shards:
     raise SystemExit(
-        "No dataset found.\n"
+        "No dataset found.\\n"
         "Upload jungle-dataset.tar.gz with the file pane (folder icon) into the "
         "'data' folder, or into the runtime root, then run this cell again.")
 """),
@@ -270,7 +270,131 @@ t0 = time.time()
 print("training took %.1f minutes" % ((time.time() - t0) / 60))
 """),
     md("""
-## 7. Export
+## 7. The learning curve
+
+Two curves per configuration, and the second one is the one that matters.
+
+The **validation loss** is how well the network predicts the training
+target.  The **correlation with the game outcome** is how well it predicts
+*who won the game* -- the thing a value function is actually for.  A
+network can have a falling validation loss and a falling correlation at the
+same time, and only one of them is playing strength.
+
+The curves are for the held-out positions, so they are not the numbers the
+network was fitted to.  The horizontal axis is the epoch and the label says
+how long the run had been going, because the runs are cut by the clock
+rather than by the epoch count.
+"""),
+    code("""
+import glob, json, os
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+runs = sorted(glob.glob("runs/budget/*/history.json"))
+print("runs with a curve:", len(runs))
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+for path in runs:
+    name = os.path.basename(os.path.dirname(path))
+    try:
+        h = json.load(open(path))
+    except Exception as exc:
+        print("  ", name, "unreadable:", exc)
+        continue
+    curve = h.get("curve") or []
+    if not curve:
+        print("  ", name, "has no curve")
+        continue
+    epochs = [c["epoch"] for c in curve]
+    loss = [c["val_loss"] for c in curve]
+    corr = [c.get("corr", 0.0) for c in curve]
+    minutes = curve[-1].get("minutes", 0.0)
+    label = f"{name}  ({minutes:.0f} min)"
+    axes[0].plot(epochs, loss, marker=".", label=label)
+    axes[1].plot(epochs, corr, marker=".", label=label)
+    best = max(corr) if corr else 0.0
+    print(f"  {name}: best val_loss {min(loss):.6f}  best corr(outcome) {best:+.4f}")
+
+axes[0].set_xlabel("epoch")
+axes[0].set_ylabel("validation loss")
+axes[0].set_title("Validation loss (lower is better)")
+axes[1].set_xlabel("epoch")
+axes[1].set_ylabel("correlation with the game outcome")
+axes[1].set_title("Playing strength (higher is better)")
+for ax in axes:
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig("/content/learning-curve.png", dpi=120)
+print("wrote /content/learning-curve.png")
+try:
+    from IPython.display import Image, display
+    display(Image(filename="/content/learning-curve.png"))
+except Exception:
+    pass
+"""),
+    md("""
+## 8. Pick the strongest candidate -- by playing strength
+
+A lower validation loss does not mean a stronger engine.  A wider network
+evaluates more accurately but also more slowly, and at a fixed clock the
+slower engine searches less deeply, so the network with the best loss can
+easily be the weaker player.
+
+So the candidates play.  Each one plays the handcrafted engine, which is
+the baseline the whole project has to beat, and the scores are printed.
+The winner is copied to `/content/net-strongest.nnue` and replaces
+`/content/net.nnue`.
+
+The clock is short on purpose: a long match would take longer than the
+training did.  What is being measured here is which candidate to take
+forward, not the final acceptance number.
+"""),
+    code("""
+import glob, json, os, shutil, subprocess
+
+MATCH_GAMES = int(os.environ.get("MATCH_GAMES", "30"))
+MATCH_TIME = float(os.environ.get("MATCH_TIME", "0.25"))
+THREADS = str(os.cpu_count() or 2)
+
+results = []
+for net in sorted(glob.glob("/content/candidates/*.nnue")):
+    name = os.path.basename(net)
+    print(f"\\n=== {name} vs the handcrafted engine "
+          f"({MATCH_GAMES} games at {MATCH_TIME}s/move) ===", flush=True)
+    proc = subprocess.run(
+        ["./engine/build/match", "--games", str(MATCH_GAMES),
+         "--threads", THREADS, "--time", str(MATCH_TIME),
+         "--engine-a", f"ab:nnue={net}", "--engine-b", "ab"],
+        capture_output=True, text=True)
+    try:
+        d = json.loads(proc.stdout)
+    except Exception:
+        print(proc.stdout[-500:], proc.stderr[-500:])
+        continue
+    score = d["score_a"]
+    print(f"    {d['a_wins']} W / {d['b_wins']} L / {d['draws']} D   "
+          f"score {score:.3f}   Elo {d['elo_a']:+.1f}   "
+          f"decisive {d.get('decisive_score_a', float('nan')):.3f}")
+    results.append((score, name, net))
+
+if results:
+    results.sort(reverse=True)
+    print("\\n=== the candidates, strongest first ===")
+    for score, name, net in results:
+        print(f"    {score:.3f}  {name}")
+    best = results[0]
+    shutil.copyfile(best[2], "/content/net-strongest.nnue")
+    shutil.copyfile(best[2], "/content/net.nnue")
+    print(f"\\nstrongest: {best[1]}  ->  /content/net-strongest.nnue")
+    with open("/content/strength.json", "w") as f:
+        json.dump([{"name": n, "score": sc} for sc, n, _ in results], f, indent=2)
+else:
+    print("no candidates were measured")
+"""),
+    md("""
+## 9. Export
 
 The exported file holds the int8 weights, the per-layer scales and biases,
 and the architecture metadata.  The C++ engine reads it directly.
@@ -296,7 +420,7 @@ print("best net:", "/content/net.nnue",
       "%.2f MB" % (os.path.getsize("/content/net.nnue") / 1e6) if os.path.exists("/content/net.nnue") else "MISSING")
 """),
     md("""
-## 8. Verify
+## 10. Verify
 
 This proves that the PyTorch forward pass and the C++ inference produce
 identical values, so the engine plays exactly the network that was trained.
@@ -310,7 +434,7 @@ for ck in sorted(glob.glob("runs/budget/*/best.pt")):
     os.system(f"./engine/build/nnue_check /content/net.nnue 5 60")
 """),
     md("""
-## 9. Download the network
+## 11. Download the network
 
 `net.nnue` is about 300 KB.  Put it in the project's `net.nnue` and you can
 run the match locally:
@@ -327,16 +451,24 @@ from google.colab import files
 # The best network ...
 files.download("/content/net.nnue")
 
+# The learning curve ...
+if os.path.exists("/content/learning-curve.png"):
+    files.download("/content/learning-curve.png")
+
 # ... every candidate, in one archive, so the strongest one can be chosen by
 # playing strength rather than by validation loss.
 zip_path = "/content/candidates.zip"
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
     for f in glob.glob("/content/candidates/*.nnue"):
         z.write(f, os.path.basename(f))
+    for f in ("/content/net-strongest.nnue", "/content/learning-curve.png",
+              "/content/strength.json"):
+        if os.path.exists(f):
+            z.write(f, os.path.basename(f))
 files.download(zip_path)
 """),
     md("""
-## 10. (Optional) Take the data with you, and start the next round
+## 12. (Optional) Take the data with you, and start the next round
 
 The shards the background generator produced are worth keeping: they are
 teacher data for the *next* iteration.  The cell below packs them and stops
@@ -358,7 +490,7 @@ if shards:
     files.download("/content/jungle-dataset-round2.tar.gz")
 """),
     md("""
-## 11. (Optional) Start the expert-iteration round
+## 13. (Optional) Start the expert-iteration round
 
 This is the self-play reinforcement loop.  The network you have just trained
 becomes the MCTS teacher's leaf evaluation, so the teacher's values are now

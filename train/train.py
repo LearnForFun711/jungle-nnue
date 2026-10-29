@@ -241,6 +241,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_val = float("inf")
+    curve = []
     step = 0
     start = time.time()
     stop = False
@@ -303,15 +304,26 @@ def main():
                 break
 
         # --- validation ---------------------------------------------------
+        #
+        # Two numbers are measured here.  The validation loss is how well the
+        # network predicts the training target.  The correlation with the
+        # game outcome is how well it predicts *who won*, which is what a
+        # value function is for and what decides how strong the engine is.
+        # The second is the one worth watching: a network can have a
+        # falling validation loss and a falling correlation at the same
+        # time, and only one of those is playing strength.
         model.eval()
         vs, vn = 0.0, 0
+        # Pearson accumulators for the correlation with the outcome.
+        n_corr = 0
+        s_v = s_vv = s_r = s_rr = s_vr = 0.0
         with torch.no_grad():
             for i in range(0, len(va_idx), 8192):
                 idx = va_idx[i:i + 8192]
-                ti = torch.from_numpy(idx)
+                ti = torch.from_numpy(idx)          # host index
                 if resident:
-                    ti = ti.to(device)
-                    b, s, y = board_all[ti].long(), stm_all[ti], target_all[ti]
+                    td = ti.to(device)
+                    b, s, y = board_all[td].long(), stm_all[td], target_all[td]
                 else:
                     b = board_t[ti].to(device).long()
                     s = stm_t[ti].to(device)
@@ -321,8 +333,30 @@ def main():
                     v = model(fr, fb, s)
                 vs += torch.nn.functional.mse_loss(v.float(), y.float()).item() * len(idx)
                 vn += len(idx)
+
+                # float32 throughout: the MPS backend has no float64, and
+                # the sums are accumulated in Python floats anyway.
+                vf = v.float()
+                # result_t stays on the host: it is only used for the
+                # correlation, and the index has to be a host index too.
+                rf = result_t[ti].float().to(device)    # host index, as above
+                s_v += float(vf.sum())
+                s_vv += float((vf * vf).sum())
+                s_r += float(rf.sum())
+                s_rr += float((rf * rf).sum())
+                s_vr += float((vf * rf).sum())
+                n_corr += len(idx)
         val = vs / max(1, vn)
-        print(f"epoch {epoch}: val_loss {val:.6f}  ({(time.time()-start)/60:.1f} min)", flush=True)
+
+        corr = 0.0
+        if n_corr > 2:
+            cov = s_vr - s_v * s_r / n_corr
+            vv = s_vv - s_v * s_v / n_corr
+            rr = s_rr - s_r * s_r / n_corr
+            if vv > 0 and rr > 0:
+                corr = cov / math.sqrt(vv * rr)
+        print(f"epoch {epoch}: val_loss {val:.6f}  corr(outcome) {corr:+.4f}  "
+              f"({(time.time()-start)/60:.1f} min)", flush=True)
 
         # Activation health.  A layer whose units are clipped away is wasting
         # its capacity, and a layer that saturates is on its way to the
@@ -353,13 +387,17 @@ def main():
         if val < best_val:
             best_val = val
             torch.save({"model": model.state_dict(), "ft_hidden": args.ft_hidden,
-                        "hidden": args.hidden, "epoch": epoch, "val_loss": val},
+                        "hidden": args.hidden, "epoch": epoch, "val_loss": val,
+                        "corr": corr},
                        os.path.join(args.out, "best.pt"))
             print(f"  new best val_loss {val:.6f}", flush=True)
 
+        curve.append({"epoch": epoch, "val_loss": val, "corr": corr,
+                      "best": best_val, "minutes": (time.time() - start) / 60})
         with open(os.path.join(args.out, "history.json"), "w") as f:
-            json.dump({"epoch": epoch, "val_loss": val, "best": best_val,
-                       "minutes": (time.time() - start) / 60}, f, indent=2)
+            json.dump({"epoch": epoch, "val_loss": val, "corr": corr,
+                       "best": best_val, "minutes": (time.time() - start) / 60,
+                       "curve": curve}, f, indent=2)
 
         if stop:
             break
