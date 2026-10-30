@@ -83,26 +83,43 @@ The leaf evaluation is the interesting part.  A plain static evaluation gives
 the teacher values that are no better than the handcrafted evaluation it is
 meant to replace — training on it would not produce a network worth having.
 Evaluating every child position and averaging (rather than taking the
-maximum — the maximum of many noisy samples is biased towards zero) gives a
-teacher that is measurably better.
+maximum) gives a teacher that is measurably better.
 
 Measured as the Pearson correlation between the teacher's value and the actual
 outcome of the game the position came from, both from the side-to-move's point
-of view, over ~40k positions each:
+of view.  `engine/tools/teacher_probe.cpp` runs the teacher over a fixed
+sample of positions from finished games, so two configurations are always
+compared on the same positions:
 
-| leaf evaluation | correlation with the game outcome |
-|---|---|
-| handcrafted static evaluation (the thing to beat) | +0.201 |
-| MCTS, static leaf | +0.205 |
-| **MCTS, 1-ply leaf, mean aggregation** | **+0.233** |
+| teacher's leaf | how the replies are aggregated | correlation with the game outcome |
+|---|---|---|
+| handcrafted static evaluation (the thing to beat) | — | +0.147 |
+| handcrafted | mean over the opponent's replies | +0.150 |
+| handcrafted | the opponent's best reply | +0.148 |
+| handcrafted | depth-2 alpha-beta | +0.153 |
+| **network** | **mean over the opponent's replies** | **+0.209** |
+| network | the opponent's best reply | +0.118 … +0.129 |
 
-For reference, the same correlation measured only over the positions late in
-a game (ply 120+) is +0.446 for the 1-ply teacher — the signal is
-concentrated where the game is actually decided, which is what you would
-expect.
+(The absolute numbers depend on the dataset; the *ordering* is what matters.
+The same measurement over the positions late in a game, ply 120+, is far
+higher, because the signal is concentrated where the game is actually
+decided.)
 
-The 1-ply leaf costs roughly eight times as much as a static leaf, which is
-the main trade-off in the whole project: teacher quality against data volume.
+Two things in that table are worth keeping in mind.
+
+The search is not what makes the teacher's values good — the leaf is.  With
+the handcrafted evaluation, one ply of search over the opponent's replies
+moves the correlation by three thousandths.  With the network as the leaf, the
+same search is worth six hundredths, and the teacher's values become 39% more
+informative than the handcrafted ones.  This is the largest lever the project
+has, and it is why the Colab notebook puts a network into the teacher half an
+hour into the session rather than after it.
+
+The "best reply" aggregation is worse than the mean, and with a network it is
+much worse: the network's value uses only a small part of the [-1,1] range,
+so the maximum over thirty replies saturates at the clamp and the twenty
+per cent of values it produces outside [-0.5, 0.5] say more about the tail
+of the distribution than about the position.
 
 Generate data:
 
@@ -111,6 +128,15 @@ cd engine
 ./build/selfplay --games 5000 --threads 8 --sims 800 \
                  --leaf-depth 1 --leaf-agg 1 --c-puct 1.4 \
                  --out ../data/data
+```
+
+With a network as the teacher's leaf:
+
+```bash
+./build/selfplay --games 5000 --threads 8 --sims 800 \
+                 --nnue ../net/net.nnue --leaf-scale 1.0 \
+                 --leaf-depth 1 --leaf-agg 1 --c-puct 1.4 \
+                 --out ../data/round1/data
 ```
 
 Each thread writes its own shard, `data/data.t<N>.bin`, 68 bytes per
@@ -227,19 +253,45 @@ full refresh exactly.
 
 ### How well does it work?
 
-Measured on a held-out shard of the dataset, as the correlation between the
-network's value and the *outcome of the game* the position came from, from
-the side-to-move's point of view:
+Two numbers matter.  The first says whether the network is a better
+*evaluation* than the handcrafted one; the second says whether that makes it a
+better *player*.
+
+**As an evaluation.**  Measured on a held-out shard of the dataset, as the
+correlation between the network's value and the *outcome of the game* the
+position came from, from the side-to-move's point of view:
 
 | | correlation with the game outcome |
 |---|---|
 | the handcrafted evaluation | +0.161 |
-| the MCTS teacher the network is distilled from | +0.160 |
-| **the distilled network** | **+0.187** |
+| the MCTS teacher the network is distilled from | +0.150 |
+| **the distilled network** | **+0.356** |
 
-The network is a better predictor of who wins than the evaluation it
-replaces, which is the point.  The teacher is not: its value is a noisy
-estimate, and regressing on it removes the noise.
+The network predicts who wins considerably better than the evaluation it
+replaces.  The teacher does not: its value is a noisy estimate of the same
+quantity, and the network regressing on it removes that noise.
+
+The network's number is a blend, and it is worth knowing why.  The training
+target is `0.75 * teacher_value + 0.25 * game_result`, and the blend's own
+correlation with the outcome is `0.75 * 0.150 + 0.25 * 1.000 = 0.362`.  The
+network reaches +0.356, which is what it looks like when a network has
+learned its target as well as the target can be learned.  So a third of the
+information comes from the teacher's search and two thirds from the game's
+result — and the result is the only ground truth there is.
+
+**As a player.**  400 games against the handcrafted engine, one second per
+move, the colours alternating from game to game:
+
+| | |
+|---|---|
+| neural engine | **202 wins, 13 losses, 185 draws** |
+| score | **0.736**, 95% confidence interval **[0.693, 0.779]** |
+| Elo | **+178** |
+| decisive games | 93.9% won, 95% confidence interval [0.908, 0.971] |
+
+Every one of the 215 decisive games was won by entering the opponent's den,
+which is how the game is supposed to be won; the other 185 ended in a
+three-fold repetition.
 
 The network width is a trade-off, and it is worth being explicit about it.
 A wider network predicts slightly better but evaluates more slowly, and at a
@@ -323,7 +375,8 @@ engine/
   src/nnue.hpp        int8 network: format, loading, inference
   src/search.hpp      iterative-deepening alpha-beta with a transposition table
   src/engine_api.hpp  one interface over alpha-beta and MCTS
-  tools/              selfplay, match, dump_moves, eval_nnue, nnue_check, bench
+  tools/              selfplay, match, dump_moves, eval_nnue, nnue_check, bench,
+                      teacher_probe
 train/
   dataset.py          shard reader
   model.py            quantisation-aware NNUE
@@ -333,8 +386,12 @@ scripts/
   verify_rules.py     C++ vs. reference rule check
   verify_golden.py    C++ vs. recorded golden positions
   verify_nnue.py      torch vs. C++ parity check
+  verify_notebook.py  every cell of the Colab notebook parses
   analyze_data.py     dataset quality report
   package_data.py     pack the shards for a single upload
+  eval_teacher_quality.py  how well the teacher's values predict the outcome
+  eval_teacher_configs.py  compare teacher configurations on the same positions
+  eval_net_quality.py      how well a network predicts the outcome
   verify_all.sh       everything the CI checks
   make_colab_notebook.py
 colab/

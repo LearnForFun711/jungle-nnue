@@ -238,16 +238,74 @@ line option so it can be tuned per network.
 
 ## The teacher is only as good as its leaf
 
-The teacher's values correlate with the result of the game by about 0.14,
-whether the leaf is the handcrafted evaluation or a network.  The network's
-own value correlates by 0.36.  So the teacher dilutes the signal it is
-given: the search averages the values of the children, and that average is
-worse than the network's own opinion of the position.
+The teacher's values are what the network learns from, so their quality is the
+ceiling on the network's quality.  Every position in a shard carries the value
+the teacher gave it and the result of the game it came from, and the
+correlation between the two is the teacher's quality.
+`engine/tools/teacher_probe.cpp` measures it by running the teacher over a
+fixed sample of those positions, so that two configurations are always
+compared on the same positions.
 
-This is the ceiling of the whole project.  More GPU time does not raise it.
-What raises it is a network that predicts the outcome better, and the
-training target blends the teacher's value with the result of the game for
-exactly that reason — the result is the only ground truth there is.
+Measured over 2,500 positions of the shipped dataset, with the same 800
+simulations per move that the data was generated with:
+
+| teacher's leaf | how the replies are aggregated | corr(value, result) |
+|---|---|---|
+| handcrafted | static evaluation, no search | +0.147 |
+| handcrafted | mean over the opponent's replies | +0.150 |
+| handcrafted | the opponent's best reply | +0.148 |
+| handcrafted | depth-2 alpha-beta | +0.153 |
+| **network** | **mean over the opponent's replies** | **+0.209** |
+| network | the opponent's best reply | +0.118 … +0.129 |
+
+Three things follow from that table.
+
+The search is not what makes the teacher's values good; the leaf is.  With the
+handcrafted evaluation, one ply of search over the opponent's replies moves
+the correlation by three thousandths: the teacher is barely better than the
+static evaluation it sits on top of.  With the network as the leaf, the same
+search is worth six hundredths, and the teacher's values are 39% more
+informative than the handcrafted ones.
+
+The "best reply" aggregation is worse than the mean, and with a network it is
+much worse.  The network's value uses only a small part of the [-1,1] range,
+so the maximum over the opponent's thirty replies is decided by the luckiest
+of thirty samples and then saturates at the clamp.  Twenty per cent of the
+values end up outside [-0.5, 0.5] and their mean is dragged to -0.37: the
+aggregation has stopped measuring the position and started measuring the tail
+of the distribution.  The mean keeps the distribution's scale and stays
+informative.
+
+The scale of the leaf matters for the same reason.  The network's value is
+clamped before it is aggregated, and clamping hard enough destroys the
+ordering it was supposed to preserve: the correlation falls from +0.209 at
+scale 1 to +0.198 at scale 10, where six per cent of the values are clipped.
+
+This is the single largest lever the project has, and it is why the Colab
+notebook puts a network into the teacher half an hour into the session rather
+than after it.
+
+## What the network actually learns from
+
+The training target for a position is a blend of the teacher's value and the
+result of the game:
+
+    target = 0.75 * teacher_value + 0.25 * game_result
+
+The trained network's correlation with the game outcome is +0.356, and the
+blend's own correlation with the game outcome is 0.75 x 0.150 + 0.25 x 1.000
+= 0.362.  The two agree to within the noise, which says the network predicts
+its target about as well as the target can be predicted: it has learned the
+blend.
+
+That is worth spelling out, because it says where the strength comes from.
+A third of the target's information about the outcome comes from the
+teacher's search and two thirds from the game's result — and the result is
+the only ground truth there is.  Raising the teacher from 0.150 to 0.209
+lifts the target's correlation with the outcome from 0.362 to 0.407, so the
+work does compound; but no amount of teacher quality gets past the fact that
+the teacher is estimating a quantity the game's result already answers
+exactly.
 
 ## The search found mates it did not play
 

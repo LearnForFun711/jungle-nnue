@@ -40,6 +40,8 @@ struct MctsParams {
     int    max_ply         = 200;   // draw by length
     bool   use_nnue        = false;
     double leaf_scale      = 1.0;  // scales the neural leaf evaluation
+    double hybrid          = 0.0;  // weight of the handcrafted evaluation
+                                     // in a neural leaf (0 = network only)
 };
 
 enum NodeStatus : int8_t { ST_ONGOING = 0, ST_WIN = 1, ST_LOSS = -1, ST_DRAW = 2 };
@@ -187,7 +189,7 @@ private:
     double base_eval(const Position& pos) {
         if (p_.use_nnue && ev_ && ev_->uses_nnue()) {
             const float v = float(ev_->eval(pos)) / 1000.0f * float(p_.leaf_scale);
-            return double(std::max(-1.0f, std::min(1.0f, v)));
+            return neural_leaf(v, pos);
         }
         return normalise(evaluate(pos));
     }
@@ -196,9 +198,27 @@ private:
     double base_eval_cached(const Position& pos) {
         if (p_.use_nnue && ev_ && ev_->uses_nnue()) {
             const float v = float(ev_->eval_cached(pos)) / 1000.0f * float(p_.leaf_scale);
-            return double(std::max(-1.0f, std::min(1.0f, v)));
+            return neural_leaf(v, pos);
         }
         return normalise(evaluate(pos));
+    }
+
+    // Mix the network's value with the handcrafted evaluation.
+    //
+    // The network learns the teacher's values, so it already contains most of
+    // what the handcrafted evaluation knows -- but not necessarily the
+    // tactical parts of it: the trap danger and the exposed-piece terms are
+    // hand-written rules, and a network trained on positions rarely learns a
+    // rule exactly.  Mixing the two lets the teacher keep the network's
+    // positional knowledge and the rules' tactical precision at the same
+    // time.  `hybrid` is the weight of the handcrafted evaluation; at 0 the
+    // leaf is the network alone.
+    double neural_leaf(double net_value, const Position& pos) {
+        const double v = std::max(-1.0, std::min(1.0, net_value));
+        if (p_.hybrid <= 0.0) return v;
+        const double hc = normalise(evaluate(pos));
+        const double w = std::max(0.0, std::min(1.0, p_.hybrid));
+        return (1.0 - w) * v + w * hc;
     }
 
     double leaf_value(const Position& pos) {

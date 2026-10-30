@@ -53,6 +53,7 @@ struct Options {
     double      widening = 1.6;
     int         leaf_agg = 1;
     double      leaf_scale = 1.0;
+    double      hybrid = 0.0;
 };
 
 struct GameRecord {
@@ -175,6 +176,7 @@ int main(int argc, char** argv) {
         else if (a == "--widening") o.widening = std::stod(next());
         else if (a == "--leaf-agg") o.leaf_agg = std::stoi(next());
         else if (a == "--leaf-scale") o.leaf_scale = std::stod(next());
+        else if (a == "--hybrid") o.hybrid = std::stod(next());
     }
 
     MctsParams params;
@@ -186,6 +188,7 @@ int main(int argc, char** argv) {
     params.widening_k = o.widening;
     params.leaf_agg = o.leaf_agg;
     params.leaf_scale = o.leaf_scale;
+    params.hybrid = o.hybrid;
 
     Evaluator ev;
     if (!o.nnue.empty()) {
