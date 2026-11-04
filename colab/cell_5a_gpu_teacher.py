@@ -2,25 +2,30 @@
 #
 # Copy this cell into Colab and run it in place of the notebook's own 5a.
 #
-# Two things went wrong before, and both are handled here.
+# Three things have gone wrong here, and all three are handled below.
 #
-# 1. Colab does not set CUDA_HOME, and torch needs it.  Without it torch
-#    cannot find the CUDA runtime to link the extension against, the shared
-#    object is built without the runtime's path in it, and the import fails
-#    with "cannot open shared object file" -- which says nothing about what
-#    is wrong.
+# 1. The clone was stale.  The notebook clones the project, and a clone
+#    made before a fix is a clone that cannot build.  A shallow clone
+#    cannot always be pulled, so the cell fetches the tip of main and
+#    resets to it, which always works.
 #
-# 2. nvcc has a rule the plain C++ compiler does not: a function called from
-#    device code has to be a device function itself.  The move generator
-#    called piece_type() and feature_index(), and neither was marked, so
-#    nvcc rejected the file.  This is the "GPU function calling a CPU
-#    function" error, and it is a compile error, not a runtime one.
+# 2. nvcc has a rule the plain C++ compiler does not: a function called
+#    from device code has to be a device function itself.  The move
+#    generator called piece_type() and feature_index(), and neither was
+#    marked, so nvcc rejected the file.  This is the "GPU function calling
+#    a CPU function" error, and it is a compile error, not a runtime one.
 #
-# The cell fetches the fixed sources straight from GitHub rather than
-# pulling: the clone in a notebook is shallow, and a pull in it can fail
-# silently.  If the fetch works, the build should work; if it does not,
-# the cell prints the compiler's own message, which is the part that
-# matters.
+# 3. torch keeps a record, per process, of which extensions it has built
+#    and whether the sources have changed since.  If a build failed, that
+#    record still says the module is up to date: the next build is
+#    skipped, and the import then fails on a shared object that was never
+#    produced -- with an error that mentions nothing about the build.  A
+#    failed build poisons every later attempt until the record is cleared.
+#
+# The cell also fetches the six GPU sources straight from GitHub, so that
+# a clone made before the fix cannot be the one that is built, and prints
+# the compiler's own message if the build fails -- that message is inside
+# the exception, not in the one line the traceback ends with.
 
 import ctypes
 import glob
@@ -36,7 +41,18 @@ RAW = "https://raw.githubusercontent.com/LearnForFun711/jungle-nnue/main/engine/
 SOURCES = ("jungle_gpu.h", "jungle_gpu.cuh", "jungle_mcts.cuh", "jungle_game.cuh",
            "jungle_gpu_common.cpp", "jungle_gpu_cuda.cu")
 
-# --- 1. get the fixed sources ------------------------------------------------
+# --- 1. make the clone current ------------------------------------------------
+try:
+    subprocess.run(["git", "fetch", "--depth", "1", "origin", "main"],
+                   capture_output=True, timeout=300)
+    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"],
+                   capture_output=True, timeout=120)
+    print("git:", subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True).stdout.strip())
+except Exception as exc:
+    print("git sync failed:", exc)
+
+# --- 2. get the fixed sources -------------------------------------------------
 print("--- fetching the GPU sources ---")
 for name in SOURCES:
     try:
@@ -47,9 +63,8 @@ for name in SOURCES:
         print(f"  {name:24s} {len(data):7d} bytes")
     except Exception as exc:
         print(f"  {name:24s} COULD NOT FETCH: {exc}")
-print("  (if these were fetched, the sources are the fixed ones)")
 
-# --- 2. the CUDA toolkit and ninja -------------------------------------------
+# --- 3. the CUDA toolkit and ninja ---------------------------------------------
 if not os.environ.get("CUDA_HOME"):
     candidates = ["/usr/local/cuda"]
     try:
@@ -67,13 +82,22 @@ print("CUDA_HOME =", os.environ.get("CUDA_HOME"))
 if shutil.which("ninja") is None:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"], check=False)
 
-# --- 3. build -----------------------------------------------------------------
+# --- 4. build ------------------------------------------------------------------
 import torch
 from torch.utils.cpp_extension import load
 
 BUILD = "/content/jungle-gpu-build"
 shutil.rmtree(BUILD, ignore_errors=True)      # no stale objects from a failed run
 os.makedirs(BUILD, exist_ok=True)
+
+# Clear torch's record of what it thinks it has already built, so that a
+# failed build does not make every later attempt skip the build.
+try:
+    from torch.utils.cpp_extension import JIT_EXTENSION_VERSIONER
+    JIT_EXTENSION_VERSIONER.entries.clear()
+    print("cleared torch's record of what it has already built")
+except Exception as exc:
+    print("could not clear torch's build record:", exc)
 
 EXT = None
 if not torch.cuda.is_available():

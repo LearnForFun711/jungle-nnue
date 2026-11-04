@@ -75,7 +75,7 @@ def find_project():
 
 root = find_project()
 if root is None:
-    r = subprocess.run(["git", "clone", "--depth", "1", REPO_URL, "jungle-nnue"])
+    r = subprocess.run(["git", "clone", REPO_URL, "jungle-nnue"])
     if r.returncode != 0:
         raise SystemExit(
             "git clone failed -- if the repo is private, clone it manually and unzip it "
@@ -253,6 +253,20 @@ carries on with the CPU generator and nothing else changes.
     code("""
 import ctypes, glob, os, shutil, subprocess, sys, traceback, urllib.request
 
+# --- make the clone current --------------------------------------------------
+# A notebook clones the project, and a clone made before a fix is a clone
+# that cannot build.  Fetching the tip of main and resetting to it always
+# works, where "git pull" in a shallow clone sometimes does not.
+try:
+    subprocess.run(["git", "fetch", "--depth", "1", "origin", "main"],
+                   capture_output=True, timeout=300)
+    subprocess.run(["git", "reset", "--hard", "FETCH_HEAD"],
+                   capture_output=True, timeout=120)
+    print("git:", subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True).stdout.strip())
+except Exception as exc:
+    print("git sync failed:", exc)
+
 # --- get the GPU sources -----------------------------------------------------
 # nvcc has a rule the plain C++ compiler does not: a function called from
 # device code has to be a device function itself.  The move generator calls
@@ -302,6 +316,18 @@ from torch.utils.cpp_extension import load
 BUILD = "/content/jungle-gpu-build"
 shutil.rmtree(BUILD, ignore_errors=True)      # no stale objects from a failed run
 os.makedirs(BUILD, exist_ok=True)
+
+# torch keeps a record, per process, of which extensions it has built and
+# whether the sources have changed since.  If a build failed, that record
+# still says the module is up to date: the next build is skipped, and the
+# import then fails on a shared object that was never produced.  Clearing
+# the record makes it build again.
+try:
+    from torch.utils.cpp_extension import JIT_EXTENSION_VERSIONER
+    JIT_EXTENSION_VERSIONER.entries.clear()
+    print("cleared torch's record of what it has already built")
+except Exception as exc:
+    print("could not clear torch's build record:", exc)
 
 EXT = None
 if not torch.cuda.is_available():

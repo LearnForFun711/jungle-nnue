@@ -101,6 +101,18 @@ def build_extension(verbose=True, build_dir=None):
 
     prepare_cuda_env()
 
+    # torch keeps a record, per process, of which extension modules it has
+    # built and whether the sources have changed since.  If a build failed,
+    # that record still says the module is up to date, and the next call
+    # skips the build entirely and then fails to import a shared object
+    # that was never produced -- with an error that says nothing about the
+    # build.  Clearing the record makes it build again.
+    try:
+        from torch.utils.cpp_extension import JIT_EXTENSION_VERSIONER
+        JIT_EXTENSION_VERSIONER.entries.clear()
+    except Exception:
+        pass
+
     build_dir = build_dir or os.path.join(ROOT, "engine", "buildgpu", "torch")
     os.makedirs(build_dir, exist_ok=True)
     name = "jungle_gpu_selfplay"
