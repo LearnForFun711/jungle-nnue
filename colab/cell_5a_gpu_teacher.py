@@ -12,6 +12,13 @@
 # makes sure ninja is there, builds the extension, and if the import still
 # fails it loads the runtime by its full path and tries again.
 #
+# There was a second reason, found once the first was out of the way: nvcc
+# has a rule the plain C++ compiler does not, and a function called from
+# device code has to be a device function itself.  The move generator
+# called piece_type() and feature_index(), and neither was marked, so the
+# .cu file did not compile at all.  That is fixed in the repository, and
+# the pull at the top of this cell brings it in.
+#
 # If it still does not work, the last thing the cell prints is the build log.
 # Paste that back and it will say what is wrong.
 
