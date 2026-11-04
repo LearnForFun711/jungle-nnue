@@ -251,7 +251,30 @@ without a GPU, a driver that does not match the toolkit -- the notebook
 carries on with the CPU generator and nothing else changes.
 """),
     code("""
-import os, sys
+import ctypes, glob, os, shutil, subprocess, sys, traceback
+
+# Colab does not set CUDA_HOME, and torch needs it.  Without it torch cannot
+# find the CUDA runtime to link the extension against: the shared object is
+# built without the runtime's path in it, and the import then fails with
+# "cannot open shared object file", which says nothing about what is wrong.
+if not os.environ.get("CUDA_HOME"):
+    candidates = ["/usr/local/cuda"]
+    try:
+        candidates += sorted(
+            [os.path.join("/usr/local", d) for d in os.listdir("/usr/local")
+             if d.startswith("cuda-")], reverse=True)
+    except OSError:
+        pass
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            os.environ["CUDA_HOME"] = candidate
+            break
+print("CUDA_HOME =", os.environ.get("CUDA_HOME"))
+
+# torch's extension loader needs ninja, and does not say so when it is
+# missing.
+if shutil.which("ninja") is None:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"], check=False)
 
 sys.path.insert(0, os.path.join("engine", "gpu"))
 import gpu_selfplay
@@ -259,6 +282,30 @@ import gpu_selfplay
 EXT = None
 if torch.cuda.is_available():
     EXT = gpu_selfplay.build_extension()
+    if EXT is None:
+        # The shared object may have been built but would not load, because
+        # the CUDA runtime is not on the loader's search path.  Loading the
+        # runtime by its full path first puts it in the process for good.
+        so = os.path.join("engine", "buildgpu", "torch", "jungle_gpu_selfplay.so")
+        cuda_lib = os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "lib64")
+        for lib in ("libcudart.so.12", "libcudart.so.11.0", "libcudart.so"):
+            path = os.path.join(cuda_lib, lib)
+            if os.path.exists(path):
+                try:
+                    ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                    print("preloaded", path)
+                except OSError as exc:
+                    print("could not preload", path, exc)
+        if os.path.exists(so):
+            import importlib.util
+            try:
+                spec = importlib.util.spec_from_file_location("jungle_gpu_selfplay", so)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                EXT = module
+                print("the extension was loaded directly")
+            except Exception:
+                traceback.print_exc()
 else:
     print("no CUDA device: the CPU teacher will be used")
 print("GPU teacher:", "ready" if EXT is not None else "not available")

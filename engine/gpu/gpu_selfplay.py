@@ -52,7 +52,41 @@ DEFAULT_DIRICHLET_EPS = 0.25
 DEFAULT_MAX_PLY = 200
 
 
-def build_extension(verbose=True):
+def prepare_cuda_env():
+    """Find the CUDA toolkit, and put ninja in place.
+
+    Colab does not set `CUDA_HOME`, and torch needs it: without it torch
+    cannot find the CUDA runtime to link the extension against, the shared
+    object is built without the path to `libcudart` in it, and the import
+    then fails with "cannot open shared object file" -- which says nothing
+    about what is actually wrong.  Setting `CUDA_HOME` makes torch put the
+    runtime's directory into the library search path of the extension, and
+    the import works.
+    """
+    if not os.environ.get("CUDA_HOME"):
+        candidates = ["/usr/local/cuda"]
+        # Colab images sometimes have the toolkit under a versioned name.
+        try:
+            for name in sorted(os.listdir("/usr/local"), reverse=True):
+                if name.startswith("cuda-"):
+                    candidates.append(os.path.join("/usr/local", name))
+        except OSError:
+            pass
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                os.environ["CUDA_HOME"] = candidate
+                print(f"  CUDA_HOME set to {candidate}")
+                break
+
+    # torch's extension loader needs ninja, and does not say so when it is
+    # missing.
+    if shutil.which("ninja") is None:
+        print("  installing ninja (torch needs it to build the extension)...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"],
+                       check=False)
+
+
+def build_extension(verbose=True, build_dir=None):
     """Compile the CUDA extension.  Returns the module, or None."""
     try:
         import torch
@@ -65,16 +99,9 @@ def build_extension(verbose=True):
         print(f"  {CUDA_SOURCE} is missing")
         return None
 
-    # torch's extension loader needs ninja.  Colab usually has it, but not
-    # always, and the error it gives when it is missing ("Ninja is required")
-    # does not say what to do about it.
-    if shutil.which("ninja") is None:
-        if verbose:
-            print("  installing ninja (torch needs it to build the extension)...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"],
-                       check=False)
+    prepare_cuda_env()
 
-    build_dir = os.path.join(ROOT, "engine", "buildgpu", "torch")
+    build_dir = build_dir or os.path.join(ROOT, "engine", "buildgpu", "torch")
     os.makedirs(build_dir, exist_ok=True)
     name = "jungle_gpu_selfplay"
     try:
@@ -95,6 +122,22 @@ def build_extension(verbose=True):
         return module
     except Exception as exc:
         print(f"  the CUDA extension did not build: {exc}")
+        # The one-line message above hides the reason, which is usually in
+        # the build log.  Print it: a compile error and a missing runtime
+        # look the same from here.
+        log = os.path.join(build_dir, ".ninja_log")
+        if os.path.exists(log):
+            try:
+                with open(log, errors="replace") as f:
+                    tail = f.read()[-3000:]
+                if tail.strip():
+                    print("---- build log (tail) ----")
+                    print(tail)
+            except OSError:
+                pass
+        if verbose:
+            import traceback
+            traceback.print_exc()
         return None
 
 
