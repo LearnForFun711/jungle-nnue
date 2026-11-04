@@ -68,3 +68,6 @@ jobs:
         run: |
           . .venv/bin/activate
           python3 scripts/check_cuda_syntax.py
+
+      - name: Every call the device code makes is a device call
+        run: python3 scripts/check_device_calls.py

@@ -23,6 +23,17 @@ import subprocess
 import sys
 import traceback
 
+# --- 0. get the fix ----------------------------------------------------------
+# The functions the kernels call have to be marked for the device, or nvcc
+# refuses to compile the file.  If this clone is older than that fix, pull
+# it; if the pull does not work, carry on and the build log will say why.
+try:
+    subprocess.run(["git", "pull", "--ff-only"], capture_output=True, timeout=120)
+    print("git pull:", subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                      capture_output=True, text=True).stdout.strip())
+except Exception:
+    pass
+
 # --- 1. find the CUDA toolkit ------------------------------------------------
 if not os.environ.get("CUDA_HOME"):
     candidates = ["/usr/local/cuda"]

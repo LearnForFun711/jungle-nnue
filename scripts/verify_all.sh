@@ -64,4 +64,8 @@ echo "==> the CUDA source type-checks"
 python3 scripts/check_cuda_syntax.py
 
 echo
+echo "==> every call the device code makes is a device call"
+python3 scripts/check_device_calls.py
+
+echo
 echo "==> all checks passed"

@@ -31,7 +31,7 @@ struct Game {
     int result = 0;       // the result from Red's point of view
     int end_cause = END_LENGTH;
 
-    void start(GameMem* memory, const Geometry* geometry, const MctsConfig* config,
+    JGPU_DEVICE void start(GameMem* memory, const Geometry* geometry, const MctsConfig* config,
                uint64_t seed) {
         mem = memory;
         geom = geometry;
@@ -51,7 +51,7 @@ struct Game {
         t.begin_search();
     }
 
-    void record_position() {
+    JGPU_DEVICE void record_position() {
         if (mem->record_count >= 256) return;
         uint8_t* rec = mem->records[mem->record_count++];
         memset(rec, 0, 68);
@@ -65,7 +65,7 @@ struct Game {
 
     // Run one simulation.  Returns true when the search needs the value of
     // the expanded node, which is the part that gets batched.
-    bool step_search() {
+    JGPU_DEVICE bool step_search() {
         if (phase != GAME_SEARCH) return false;
         if (t.sim >= cfg->sims) { phase = GAME_MOVE; return false; }
         const bool needs_batch = t.descend();
@@ -74,7 +74,7 @@ struct Game {
     }
 
     // The search is over: record its value and play the move.
-    void step_move() {
+    JGPU_DEVICE void step_move() {
         if (phase != GAME_MOVE) return;
         const GpuNode& r = mem->nodes[t.root];
 
@@ -146,7 +146,7 @@ struct Game {
     }
 
     // Fill in the results of the game, now that it is known.
-    void finish_records() {
+    JGPU_DEVICE void finish_records() {
         for (int i = 0; i < mem->record_count; ++i) {
             uint8_t* rec = mem->records[i];
             const int stm = rec[63] & 1;

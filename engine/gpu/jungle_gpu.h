@@ -48,12 +48,12 @@ constexpr int ST_ONGOING = 0, ST_WIN = 1, ST_LOSS = -1, ST_DRAW = 2;
 // Why a game ended, matching engine/tools/selfplay.cpp.
 constexpr int END_DEN = 0, END_NO_MOVES = 1, END_REPETITION = 2, END_LENGTH = 3;
 
-inline int sq_index(int r, int c) { return r * WIDTH + c; }
-inline int sq_row(int s) { return s / WIDTH; }
-inline int sq_col(int s) { return s % WIDTH; }
-inline int piece_type(int p) { return p <= 8 ? p : p - 8; }
-inline int piece_color(int p) { return p == 0 ? -1 : (p <= 8 ? RED : BLACK); }
-inline int make_piece(int color, int type) { return color == RED ? type : type + 8; }
+JGPU_DEVICE inline int sq_index(int r, int c) { return r * WIDTH + c; }
+JGPU_DEVICE inline int sq_row(int s) { return s / WIDTH; }
+JGPU_DEVICE inline int sq_col(int s) { return s % WIDTH; }
+JGPU_DEVICE inline int piece_type(int p) { return p <= 8 ? p : p - 8; }
+JGPU_DEVICE inline int piece_color(int p) { return p == 0 ? -1 : (p <= 8 ? RED : BLACK); }
+JGPU_DEVICE inline int make_piece(int color, int type) { return color == RED ? type : type + 8; }
 
 // ---------------------------------------------------------------------------
 // The position key
@@ -201,7 +201,7 @@ bool load_net(const char* path, Net& net);
 
 // The feature index of a piece on a square, seen from `own`'s perspective.
 // Matches feature_index() in engine/src/nnue.hpp.
-inline int feature_index(int sq, int piece, int own) {
+JGPU_DEVICE inline int feature_index(int sq, int piece, int own) {
     const int t = piece_type(piece) - 1;
     const bool own_piece = (piece_color(piece) == own);
     const int r = sq_row(sq), c = sq_col(sq);

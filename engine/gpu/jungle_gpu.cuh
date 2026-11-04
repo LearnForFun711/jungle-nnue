@@ -86,7 +86,7 @@ constexpr uint64_t COL0 = make_col0();
 constexpr uint64_t COL_LAST = COL0 << (WIDTH - 1);
 constexpr uint64_t ROW_LAST = make_row_last();
 
-inline uint64_t bit(int s) { return 1ULL << s; }
+JGPU_DEVICE inline uint64_t bit(int s) { return 1ULL << s; }
 
 // Move every piece of `m` one square in direction `d`.
 inline JGPU_DEVICE uint64_t shift_dir(uint64_t m, int d) {

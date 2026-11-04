@@ -127,7 +127,7 @@ struct Teacher {
     // ---- random numbers ------------------------------------------------
     // A small xorshift: the GPU has no room for a Mersenne twister, and the
     // teacher only needs noise for the root's priors and the move choice.
-    uint64_t next_random() {
+    JGPU_DEVICE uint64_t next_random() {
         uint64_t x = rng;
         x ^= x << 13;
         x ^= x >> 7;
@@ -135,12 +135,12 @@ struct Teacher {
         rng = x;
         return x;
     }
-    double next_uniform() {
+    JGPU_DEVICE double next_uniform() {
         return double(next_random() >> 11) * (1.0 / 9007199254740992.0);
     }
 
     // A standard normal sample.
-    double next_gaussian() {
+    JGPU_DEVICE double next_gaussian() {
         const double u1 = fmax(1e-12, next_uniform());
         const double u2 = next_uniform();
         return sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265358979323846 * u2);
@@ -156,7 +156,7 @@ struct Teacher {
     // repetition draw, while the GPU teacher followed the priors so closely
     // that it ran into the opponent's den almost every game.  The same
     // distribution gives the same teacher.
-    double next_gamma(double alpha) {
+    JGPU_DEVICE double next_gamma(double alpha) {
         if (alpha < 1.0) {
             // Boost: a gamma of a small shape is a gamma of a larger shape
             // scaled down by a power of a uniform sample.
@@ -179,7 +179,7 @@ struct Teacher {
     // The same heuristic the CPU teacher uses: a move into a den is worth
     // everything, a capture is worth more the bigger the victim, and a quiet
     // move is worth more the closer it gets to the enemy den.
-    float move_prior(int from, int to) const {
+    JGPU_DEVICE float move_prior(int from, int to) const {
         const int mover = board.sq[from];
         const int captured = board.sq[to];
         if (geom->den_owner[to] >= 0) return 60.0f;
@@ -200,7 +200,7 @@ struct Teacher {
     // CPU teacher orders them.  The order matters: the progressive widening
     // creates the children in this order, so the moves worth exploring get
     // explored first.
-    int sorted_moves(uint8_t* from, uint8_t* to, float* prior) const {
+    JGPU_DEVICE int sorted_moves(uint8_t* from, uint8_t* to, float* prior) const {
         MoveBuf buf;
         const int n = generate_moves(board, *geom, buf);
         for (int i = 0; i < n; ++i) {
@@ -228,14 +228,14 @@ struct Teacher {
 
     // ---- the tree ------------------------------------------------------
 
-    uint32_t new_node(uint32_t parent) {
+    JGPU_DEVICE uint32_t new_node(uint32_t parent) {
         const uint32_t idx = node_count++;
         mem->nodes[idx] = GpuNode();
         mem->nodes[idx].parent = parent;
         return idx;
     }
 
-    int max_children_allowed(uint32_t node) const {
+    JGPU_DEVICE int max_children_allowed(uint32_t node) const {
         const GpuNode& n = mem->nodes[node];
         const int budget = 1 + int(cfg->widening_k * sqrt(double(n.visits)));
         int limit = budget < cfg->widening_max ? budget : cfg->widening_max;
@@ -244,7 +244,7 @@ struct Teacher {
     }
 
     // Start a new search from the current position.
-    void begin_search() {
+    JGPU_DEVICE void begin_search() {
         node_count = 1;
         root = 0;
         mem->nodes[0] = GpuNode();
@@ -262,7 +262,7 @@ struct Teacher {
     // Create the next child of a node.  The move list is regenerated and
     // re-sorted rather than stored, which keeps the tree small; the order is
     // deterministic, so the k-th child is always the same move.
-    uint32_t create_child(uint32_t node) {
+    JGPU_DEVICE uint32_t create_child(uint32_t node) {
         GpuNode& parent = mem->nodes[node];
         uint8_t from[MAX_CHILDREN], to[MAX_CHILDREN];
         float prior[MAX_CHILDREN];
@@ -331,7 +331,7 @@ struct Teacher {
 
     // Walk down the tree.  Returns true when the search has to stop and wait
     // for the value of an expanded node.
-    bool descend() {
+    JGPU_DEVICE bool descend() {
         depth = 0;
         path[0] = root;
         while (true) {
@@ -406,7 +406,7 @@ struct Teacher {
     // the children will be created in.  The child boards are written by the
     // caller (they go into the batch), and the values are expected back in
     // the same order.
-    bool prepare_expansion() {
+    JGPU_DEVICE bool prepare_expansion() {
         GpuNode& n = mem->nodes[expand_node];
         const int nmoves = sorted_moves(child_from, child_to, child_prior);
         n.num_moves = uint16_t(nmoves);
@@ -420,7 +420,7 @@ struct Teacher {
 
     // The children's values have arrived: average them, which is what the
     // one-ply leaf does.
-    void finish_expansion(const float* child_values) {
+    JGPU_DEVICE void finish_expansion(const float* child_values) {
         GpuNode& n = mem->nodes[expand_node];
 
         // A move into the opponent's den wins at once.  The CPU teacher's
@@ -448,7 +448,7 @@ struct Teacher {
     }
 
     // Send the value back up the tree and restore the board.
-    void backup() {
+    JGPU_DEVICE void backup() {
         for (int i = depth; i >= 0; --i) {
             GpuNode& n = mem->nodes[path[i]];
             n.visits++;
