@@ -65,6 +65,15 @@ def build_extension(verbose=True):
         print(f"  {CUDA_SOURCE} is missing")
         return None
 
+    # torch's extension loader needs ninja.  Colab usually has it, but not
+    # always, and the error it gives when it is missing ("Ninja is required")
+    # does not say what to do about it.
+    if shutil.which("ninja") is None:
+        if verbose:
+            print("  installing ninja (torch needs it to build the extension)...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"],
+                       check=False)
+
     build_dir = os.path.join(ROOT, "engine", "buildgpu", "torch")
     os.makedirs(build_dir, exist_ok=True)
     name = "jungle_gpu_selfplay"
@@ -75,7 +84,11 @@ def build_extension(verbose=True):
             name=name,
             sources=[CUDA_SOURCE, COMMON_SOURCE],
             extra_cflags=["-O3", "-std=c++17"],
-            extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
+            # No --use_fast_math: the forward pass has to give the same
+            # numbers as the engine's, and fast math would let the compiler
+            # change the rounding of the divisions.
+            extra_cuda_cflags=["-O3", "-lineinfo"],
+            extra_include_paths=[GPU_DIR],
             build_directory=build_dir,
             verbose=verbose,
         )
