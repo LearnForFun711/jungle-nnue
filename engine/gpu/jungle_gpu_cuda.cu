@@ -350,10 +350,15 @@ __global__ void nnue_batch_kernel(const Net* net, const uint8_t* boards, const i
     float* shared_h0 = slice + 2 * FH;
     float* shared_h1 = slice + 2 * FH + 2 * H;
 
-    if (i >= count) return;
-    const float value = nnue_eval_batch(*net, boards + size_t(i) * 63, stms[i],
+    // The lanes past the end of the batch must not leave the kernel: the
+    // forward pass synchronises the warp, and a warp whose lanes have gone
+    // away is a warp whose barriers are not defined.  So the extra lanes
+    // evaluate a position that is there and their answers are dropped.
+    const bool valid = (i < count);
+    const int slot = valid ? i : 0;
+    const float value = nnue_eval_batch(*net, boards + size_t(slot) * 63, stms[slot],
                                         shared_ft, shared_h0, shared_h1);
-    if (lane == 0) out[i] = value;
+    if (lane == 0 && valid) out[i] = value;
 }
 
 // ---------------------------------------------------------------------------
