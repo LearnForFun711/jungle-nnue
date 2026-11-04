@@ -246,17 +246,41 @@ correlation between the two is the teacher's quality.
 fixed sample of those positions, so that two configurations are always
 compared on the same positions.
 
-Measured over 2,500 positions of the shipped dataset, with the same 800
-simulations per move that the data was generated with:
+Measured over 4,000 positions of a fresh shard, with the same 800
+simulations per move that the data is generated with:
 
-| teacher's leaf | how the replies are aggregated | corr(value, result) |
-|---|---|---|
-| handcrafted | static evaluation, no search | +0.147 |
-| handcrafted | mean over the opponent's replies | +0.150 |
-| handcrafted | the opponent's best reply | +0.148 |
-| handcrafted | depth-2 alpha-beta | +0.153 |
-| **network** | **mean over the opponent's replies** | **+0.209** |
-| network | the opponent's best reply | +0.118 … +0.129 |
+| teacher's leaf | scale | corr(value, result) | on decisive games | spread |
+|---|---|---|---|---|
+| handcrafted | — | +0.189 | +0.238 | 0.192 |
+| network, mean over the opponent's replies | 1.0 | +0.150 | +0.223 | 0.563 |
+| network, mean over the opponent's replies | 0.5 | +0.173 | +0.247 | 0.466 |
+| network, mean over the opponent's replies | 0.25 | +0.210 | +0.276 | 0.334 |
+| **network, mean over the opponent's replies** | **0.125** | **+0.236** | **+0.290** | 0.202 |
+| network, mean over the opponent's replies | 0.0625 | +0.241 | +0.277 | 0.121 |
+| network + a quarter of the handcrafted evaluation | 0.125 | +0.227 | +0.279 | 0.198 |
+
+The earlier version of this table was measured with a race in the measuring
+tool (see below) and put the network at +0.209 against the handcrafted
+teacher's +0.147.  The ordering survived the fix; the gap did not: with the
+race gone, the network's leaf at the right scale is 25% more informative than
+the handcrafted one, and at the engine's own scale it is worse than it.
+
+The scale is a lever of its own, and it is the one that is easiest to get
+wrong.  The engine multiplies the network's value by ten before it is used
+as a search score (`Evaluator::value_scale`), because the network only uses a
+small part of its range and a compressed evaluation makes the search give up
+on positions it thinks it is slightly behind in.  That reasoning is about
+the *search*; the teacher's leaf is a different quantity, and at a scale of
+ten three quarters of the teacher's values come out at the clamp of [-1,1].
+The spread of the values in the table is the tell: 0.192 for the handcrafted
+teacher, 0.563 for the network at scale one.  A teacher whose values are
+mostly at the ends of the range is not measuring the position, and the
+correlation with the result falls to 0.150 -- below the handcrafted teacher's.
+
+Mixing the handcrafted evaluation back into the leaf makes it worse
+(+0.227 against +0.236).  The handcrafted evaluation is not a useful
+correction to a network trained on the same game; it is noise added to a
+signal.
 
 Three things follow from that table.
 
@@ -284,6 +308,93 @@ scale 1 to +0.198 at scale 10, where six per cent of the values are clipped.
 This is the single largest lever the project has, and it is why the Colab
 notebook puts a network into the teacher half an hour into the session rather
 than after it.
+
+## The evaluator was shared between threads
+
+`selfplay` and `teacher_probe` created one `Evaluator` and handed it to
+every thread.  The evaluator holds the network's feature accumulators, and
+those are changed while a position is evaluated: the leaf evaluation
+refreshes them for the parent, moves a piece, reads the value, and moves the
+piece back, once for every legal move.
+
+With two threads evaluating at the same time, each one reads whatever the
+other has half-written.  The teacher's values came out as a mixture of
+several positions' worth of arithmetic, and the mixture was different every
+run.  The handcrafted evaluation has no such state -- it is a pure function
+of the position -- so the handcrafted teacher was never affected, which is
+why the bug hid for so long: the handcrafted path worked, and the neural
+path did not, and the difference was read as "the neural leaf is not worth
+it".
+
+Each thread has its own evaluator now.  The numbers in the table above are
+from after the fix.
+
+There is a second thing about this worth writing down.  The check that found
+it was not a test that failed; it was a *disagreement* between two
+implementations of the same thing.  The GPU teacher's values were compared
+with the CPU teacher's, position by position, and they did not match --
+because the CPU teacher's values were the racy ones.  A parity test between
+two implementations finds bugs in both of them.
+
+## The teacher on the GPU
+
+The teacher is the bottleneck of the project: the network is small and trains
+in minutes, but the data it learns from takes days to generate on a CPU,
+because every node the search expands needs the network evaluated once for
+every legal move.
+
+The teacher can run on the GPU instead, and `engine/gpu/` holds it in a form
+that compiles both as CUDA and as plain C++:
+
+* the move generator is written with bitboards.  Every legal move of every
+  piece of a type comes out of one shift and a few masks, which is what makes
+  it cheap enough to run a thousand games' worth at once;
+* the network's forward pass is the engine's own arithmetic, arranged so that
+  a warp evaluates one position at a time: the feature accumulators live in
+  the lanes' registers and the hidden layers read the activations out of
+  shared memory.  A warp evaluating a position on its own would leave
+  thirty-one lanes idle;
+* the search is a state machine.  A simulation can stop in the middle, when a
+  node is expanded and the value of the position has to be looked up, and
+  carry on once the value arrives.  That is what lets a thousand games ask
+  for their leaf evaluations at the same time and have them answered in one
+  batch;
+* the game loop writes the same 68-byte records the CPU generator writes, so
+  nothing downstream knows or cares where the data came from.
+
+Three details are worth writing down because getting them wrong is easy and
+the symptom is subtle.
+
+**The captured piece has to be put back.**  A search that walks down the
+tree and then walks back up has to undo the moves it made, and undoing a
+capture means putting the captured piece back on the square.  The first
+version of the port forgot, and the symptom was not a crash: the board after
+every search had pieces missing, so the game that followed was played on a
+board that was not the board.  The games were still legal-looking, and the
+teacher's values were still plausible, and everything was wrong.
+
+**A tree that does not know that a den entry wins is a different game.**  The
+CPU teacher marks a child that enters the opponent's den as lost, and its
+one-ply leaf evaluation returns 1.0 the moment it sees such a move.  A tree
+that does not know this will happily search past a winning move.
+
+**The order of the children decides ties, and therefore games.**  The CPU
+teacher picks the first child with the best PUCT score and the first child
+with the most visits, and both of those are ties that the creation order
+decides.  The children are therefore created in the order the priors rank
+them and kept in a list in that order.
+
+With the port checked value by value against the CPU teacher -- the root's
+noise turned off, which makes both of them deterministic -- the two agree on
+every position: 300 out of 300 leaf values identical, root values identical
+to six decimal places.
+
+How many games to run at once is measured rather than chosen.  The games
+finish at different times, and the batch has to wait for the slowest lane in
+the warp, so past a point more games in flight stop helping.  The auto-tuner
+asks the compiled code how much video memory a game needs, works out how many
+fit in the card, and then runs each candidate number and counts the positions
+per second.
 
 ## What the network actually learns from
 

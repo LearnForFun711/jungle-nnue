@@ -73,6 +73,12 @@ struct RootVisit {
 struct MctsResult {
     Move        best{0xFFFF, 0xFFFF};
     double      value = 0.0;
+    // The value of the root's own leaf evaluation: the position evaluated
+    // where it stands, without the tree's sign flips and averaging.  The
+    // visit-weighted average above is the standard MCTS root value, but the
+    // two are not the same quantity, and which one predicts the result of the
+    // game better is worth measuring rather than assuming.
+    double      leaf_value = 0.0;
     int         simulations = 0;
     std::vector<RootVisit> visits;
 };
@@ -119,6 +125,7 @@ public:
         MctsResult res;
         res.simulations = done;
         res.value = nodes_[root_].visits ? nodes_[root_].value_sum / nodes_[root_].visits : 0.0;
+        res.leaf_value = nodes_[root_].leaf_value;
 
         const MctsNode& r = nodes_[root_];
         for (uint16_t i = 0; i < r.num_children; ++i) {

@@ -6,10 +6,12 @@
 // result is known -- runs the teacher on them with a given configuration, and
 // prints one row per position:
 //
-//     value,result,ply,stored
+//     value,leaf_value,result,ply,stored
 //
-//   value   the teacher's own value for the position, from the side to move's
-//           point of view, in [-1,1]
+//   value      the teacher's root value: the visit-weighted average over the
+//              tree, in [-1,1]
+//   leaf_value the root's own leaf evaluation -- the position evaluated where
+//              it stands, without the tree's sign flips and averaging
 //   result  the result of the game the position came from, from the side to
 //           move's point of view: -1 loss, 0 draw, +1 win
 //   ply     how deep into the game the position was
@@ -55,13 +57,19 @@ struct Options {
     double hybrid      = 0.0;
     double c_puct      = 1.4;
     double widening    = 1.6;
+    double dirichlet_alpha = 0.30;
+    double dirichlet_eps   = 0.25;
     uint64_t seed      = 7;
     std::string nnue;
     std::string out;
+    std::string sample_out;   // the sampled records, verbatim
+    std::string value_out;    // the same records, with the teacher's value
+                               // replaced by the one measured here
 };
 
 struct Probe {
-    float    value;
+    float    value;       // the root's visit-weighted average
+    float    leaf_value;  // the root's own leaf evaluation
     float    result;
     uint16_t ply;
     float    stored;
@@ -110,8 +118,12 @@ int main(int argc, char** argv) {
         else if (a == "--leaf-agg") o.leaf_agg = std::stoi(next());
         else if (a == "--leaf-scale") o.leaf_scale = std::stod(next());
         else if (a == "--hybrid") o.hybrid = std::stod(next());
+        else if (a == "--sample-out") o.sample_out = next();
+        else if (a == "--value-out") o.value_out = next();
         else if (a == "--c-puct") o.c_puct = std::stod(next());
         else if (a == "--widening") o.widening = std::stod(next());
+        else if (a == "--dirichlet-alpha") o.dirichlet_alpha = std::stod(next());
+        else if (a == "--dirichlet-eps") o.dirichlet_eps = std::stod(next());
         else if (a == "--seed") o.seed = std::stoull(next());
         else if (a == "--nnue") o.nnue = next();
         else if (a == "--out") o.out = next();
@@ -157,10 +169,12 @@ int main(int argc, char** argv) {
     params.hybrid      = o.hybrid;
     params.c_puct      = o.c_puct;
     params.widening_k  = o.widening;
+    params.dirichlet_alpha = o.dirichlet_alpha;
+    params.dirichlet_eps   = o.dirichlet_eps;
 
-    Evaluator ev;
+    Evaluator ev_template;
     if (!o.nnue.empty()) {
-        if (!nnue_load(o.nnue, ev.net)) {
+        if (!nnue_load(o.nnue, ev_template.net)) {
             std::fprintf(stderr, "failed to load nnue: %s\n", o.nnue.c_str());
             return 1;
         }
@@ -173,6 +187,12 @@ int main(int argc, char** argv) {
 
     auto worker = [&](int) {
         std::mt19937_64 rng(o.seed * 0x9E3779B97F4A7C15ULL);
+        // Each thread needs its own evaluator.  The network's feature
+        // accumulators are changed while a position is evaluated, so one
+        // evaluator shared between threads hands out values that belong to
+        // another thread's position -- and the measurement then says more
+        // about the race than about the teacher.
+        Evaluator ev = ev_template;
         Mcts mcts(params, &ev);
         while (true) {
             const size_t i = next_index.fetch_add(1);
@@ -186,6 +206,7 @@ int main(int argc, char** argv) {
 
             const MctsResult r = mcts.search(pos, rng);
             probes[i].value  = float(r.value);
+            probes[i].leaf_value = float(r.leaf_value);
             probes[i].result = result;
             probes[i].ply    = pos.ply;
             probes[i].stored = stored;
@@ -196,14 +217,40 @@ int main(int argc, char** argv) {
     for (int t = 0; t < threads; ++t) pool.emplace_back(worker, t);
     for (auto& th : pool) th.join();
 
+    // Write the sampled positions out as a dataset, so that two teachers can
+    // be compared on exactly the same positions: the sample keeps the board,
+    // the side to move, the result of the game and the ply, and only the
+    // teacher's value differs.
+    auto write_shard = [&](const std::string& path, bool with_new_value) {
+        if (path.empty()) return;
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return; }
+        std::vector<uint8_t> buf;
+        buf.reserve(pick.size() * RECORD_SIZE);
+        for (size_t i = 0; i < pick.size(); ++i) {
+            const uint8_t* rec = all.data() + pick[i] * RECORD_SIZE;
+            buf.insert(buf.end(), rec, rec + RECORD_SIZE);
+            if (with_new_value) {
+                const int q = int(std::lround((double(probes[i].value) + 1.0) * 127.5));
+                buf[buf.size() - RECORD_SIZE + 64] = uint8_t(q < 0 ? 0 : (q > 255 ? 255 : q));
+            }
+        }
+        if (!buf.empty()) std::fwrite(buf.data(), 1, buf.size(), f);
+        std::fclose(f);
+        std::fprintf(stderr, "wrote %s (%zu records)\n", path.c_str(), pick.size());
+    };
+    write_shard(o.sample_out, false);
+    write_shard(o.value_out, true);
+
     std::FILE* out = stdout;
     if (!o.out.empty()) {
         out = std::fopen(o.out.c_str(), "w");
         if (!out) { std::fprintf(stderr, "cannot write %s\n", o.out.c_str()); return 1; }
     }
-    std::fprintf(out, "value,result,ply,stored\n");
+    std::fprintf(out, "value,leaf_value,result,ply,stored\n");
     for (const Probe& p : probes)
-        std::fprintf(out, "%.6f,%.1f,%u,%.6f\n", p.value, p.result, unsigned(p.ply), p.stored);
+        std::fprintf(out, "%.6f,%.6f,%.1f,%u,%.6f\n", p.value, p.leaf_value, p.result,
+                     unsigned(p.ply), p.stored);
     if (out != stdout) std::fclose(out);
 
     std::fprintf(stderr, "probed %zu positions\n", probes.size());

@@ -190,9 +190,15 @@ int main(int argc, char** argv) {
     params.leaf_scale = o.leaf_scale;
     params.hybrid = o.hybrid;
 
-    Evaluator ev;
+    // The network is loaded once, into a template that every thread copies.
+    // The copy matters: the evaluator keeps the network's feature
+    // accumulators, which are changed while a position is evaluated, so two
+    // threads sharing one evaluator would read each other's half-evaluated
+    // positions.  The handcrafted evaluation has no such state and could be
+    // shared safely, but the neural one cannot.
+    Evaluator ev_template;
     if (!o.nnue.empty()) {
-        if (!nnue_load(o.nnue, ev.net)) {
+        if (!nnue_load(o.nnue, ev_template.net)) {
             std::fprintf(stderr, "failed to load nnue: %s\n", o.nnue.c_str());
             return 1;
         }
@@ -206,6 +212,10 @@ int main(int argc, char** argv) {
 
     auto worker = [&](int tid) {
         std::mt19937_64 rng(o.seed + uint64_t(tid) * 0x9E3779B97F4A7C15ULL);
+        // Each thread gets its own evaluator: the network's feature
+        // accumulators are mutable, and sharing them between threads makes
+        // the teacher's values depend on which thread ran when.
+        Evaluator ev = ev_template;
         const std::string shard = o.out + ".t" + std::to_string(tid) + ".bin";
         const std::string polshard = o.out + ".policy.t" + std::to_string(tid) + ".bin";
         std::FILE* f = std::fopen(shard.c_str(), "wb");

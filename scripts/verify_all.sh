@@ -31,6 +31,10 @@ if ! python3 -c "import numpy, torch" >/dev/null 2>&1; then
 fi
 
 echo
+echo "==> building the GPU teacher's CPU tools"
+make -C engine gpu
+
+echo
 echo "==> end-to-end: selfplay -> train -> export -> parity -> incremental -> match"
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -48,6 +52,16 @@ python3 scripts/verify_nnue.py --checkpoint "$WORK/run/best.pt" \
 ./engine/build/nnue_check "$WORK/net.nnue" 5 60
 ./engine/build/match --games 4 --threads 2 --time 0.02 \
                       --engine-a "ab:nnue=$WORK/net.nnue" --engine-b ab
+
+echo
+echo "==> the GPU teacher and the engine's teacher agree"
+python3 scripts/verify_teacher_parity.py --shard "$WORK/data.t*.bin" \
+                                          --net "$WORK/net.nnue" \
+                                          --positions 40 --sims 60
+
+echo
+echo "==> the CUDA source type-checks"
+python3 scripts/check_cuda_syntax.py
 
 echo
 echo "==> all checks passed"

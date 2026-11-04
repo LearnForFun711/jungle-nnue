@@ -231,7 +231,122 @@ time.sleep(5)
 print(open("round1.log").read()[-800:])
 """),
     md("""
-## 5b. Did the teacher's values actually get better?
+## 5a. Put the teacher on the GPU
+
+Everything up to here generated the teacher's data on the CPU, and the CPU is
+the bottleneck: the teacher is an MCTS search, and every node it expands
+needs the network evaluated once for every legal move.
+
+The whole teacher can run on the GPU instead.  The legal moves come out of a
+bitboard move generator -- one shift and a few masks per piece type -- the
+search is the same MCTS the CPU runs, and the leaf evaluations of every game
+in flight are evaluated together in one batch.
+
+The numbers are the same numbers.  The GPU's forward pass is the engine's own
+arithmetic, and the GPU's teacher has been checked against the CPU's teacher
+value by value: on 300 positions the two agree to the last decimal.
+
+This cell compiles the CUDA extension.  If it does not build -- a runtime
+without a GPU, a driver that does not match the toolkit -- the notebook
+carries on with the CPU generator and nothing else changes.
+"""),
+    code("""
+import os, sys
+
+sys.path.insert(0, os.path.join("engine", "gpu"))
+import gpu_selfplay
+
+EXT = None
+if torch.cuda.is_available():
+    EXT = gpu_selfplay.build_extension()
+else:
+    print("no CUDA device: the CPU teacher will be used")
+print("GPU teacher:", "ready" if EXT is not None else "not available")
+"""),
+    md("""
+## 5b. Does the GPU agree with the engine?
+
+A GPU teacher that computes something else would be worse than no GPU
+teacher, so this is checked before any data is generated.
+
+The check compares the GPU's forward pass with the engine's, on positions
+that came out of real games played with the engine's own rules.  The engine's
+forward pass is the one the network was trained against, so if the two agree
+here, the GPU teacher is computing the values the CPU teacher computes.
+"""),
+    code("""
+if EXT is not None:
+    worst = gpu_selfplay.check_parity(EXT, "/content/net-first.nnue", positions=20000)
+    if worst is not None and worst > 1e-4:
+        print("the GPU does not agree with the engine -- not using it")
+        EXT = None
+"""),
+    md("""
+## 5c. How many games should be in flight?
+
+The generator runs many games at once and batches their leaf evaluations, so
+the number of games in flight is the one number that decides how fast the
+data comes out.
+
+It is not a matter of taste, and it is not written down anywhere:
+
+  * the **memory model** says how many games fit in the card's video memory.
+    Each game's tree lives on the GPU, and a 40 GB card holds far more of
+    them than a 16 GB one.
+  * the **measured curve** says how many games the chip can actually keep
+    busy.  That is usually fewer than fit: the games finish at different
+    times, and a batch has to wait for the slowest lane in the warp.
+
+The cell below measures both, prints the table it measured, and works out the
+number to use.  Nothing else in this notebook hard-codes it.
+"""),
+    code("""
+import json
+
+GPU_GAMES = 0
+if EXT is not None:
+    plan = gpu_selfplay.autotune(EXT, "/content/net-first.nnue", budget_gb=40.0, sims=800)
+    if plan:
+        GPU_GAMES = int(plan["chosen_games"])
+print("games in flight:", GPU_GAMES)
+"""),
+    md("""
+## 5d. Generate the data on the GPU
+
+This starts the GPU generator in the background.  It writes one shard per
+round, so the trainer below picks the new data up as it appears, and the
+loop can be stopped at any time without losing anything.
+
+The CPU generator that has been running since cell 4 is stopped: the GPU
+teacher produces the same records far faster, and its values are the ones
+that measured best.  The scale matters: the network's value is used at an
+eighth of the engine's scale, because at the engine's own scale the value
+is clipped most of the way and the teacher's values stop being
+discriminative -- the correlation with the result of the game falls from
+0.236 to 0.150.
+"""),
+    code("""
+import os, subprocess, sys, time
+
+if EXT is not None and GPU_GAMES > 0:
+    # The GPU generator is faster and its values are better, so the CPU one
+    # can stop.
+    subprocess.run(["pkill", "-f", "selfplay_loop.sh"])
+    subprocess.run(["pkill", "-f", "expert_iteration.sh"])
+    time.sleep(2)
+    os.makedirs("data/gpu", exist_ok=True)
+    proc = subprocess.Popen(
+        ["bash", "scripts/gpu_selfplay_loop.sh", "/content/net-first.nnue",
+         str(SELFPLAY_MINUTES), "data/gpu/data", str(GPU_GAMES)],
+        stdout=open("gpu_selfplay.log", "w"), stderr=subprocess.STDOUT)
+    print("GPU generator started (pid %d), log: gpu_selfplay.log" % proc.pid)
+    time.sleep(60)
+    print(open("gpu_selfplay.log").read()[-2000:])
+else:
+    print("no GPU teacher: the CPU generator keeps running")
+"""),
+    md("""
+## 5e. Did the teacher's values actually get better?
 
 This is the measurement that decides whether the expert-iteration loop is
 worth anything, and it is worth looking at before spending eight hours.
@@ -264,8 +379,9 @@ def teacher_quality(pattern, label):
     return out.stdout
 
 teacher_quality("data/data.t*.bin", "uploaded data (handcrafted teacher)")
-teacher_quality("data/round1/data.t*.bin", "round 1 (network in the teacher)")
 teacher_quality("data/more/data.t*.bin", "round 0 (handcrafted teacher)")
+teacher_quality("data/round1/data.t*.bin", "round 1 (network in the teacher, CPU)")
+teacher_quality("data/gpu/data.t*.bin", "round 1 (network in the teacher, GPU)")
 """),
     md("""
 ## 6. Train -- eight hours of it

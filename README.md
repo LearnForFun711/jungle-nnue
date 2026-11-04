@@ -89,37 +89,114 @@ Measured as the Pearson correlation between the teacher's value and the actual
 outcome of the game the position came from, both from the side-to-move's point
 of view.  `engine/tools/teacher_probe.cpp` runs the teacher over a fixed
 sample of positions from finished games, so two configurations are always
-compared on the same positions:
+compared on the same positions.  4,000 positions from a fresh shard, 800
+simulations a move, the network at `net/net.nnue`:
 
-| teacher's leaf | how the replies are aggregated | correlation with the game outcome |
-|---|---|---|
-| handcrafted static evaluation (the thing to beat) | — | +0.147 |
-| handcrafted | mean over the opponent's replies | +0.150 |
-| handcrafted | the opponent's best reply | +0.148 |
-| handcrafted | depth-2 alpha-beta | +0.153 |
-| **network** | **mean over the opponent's replies** | **+0.209** |
-| network | the opponent's best reply | +0.118 … +0.129 |
+| teacher's leaf | scale | correlation with the outcome | correlation on decisive games | spread of the values |
+|---|---|---|---|---|
+| handcrafted static evaluation (the thing to beat) | — | +0.189 | +0.238 | 0.192 |
+| network, mean over the opponent's replies | 1.0 | +0.150 | +0.223 | 0.563 |
+| network, mean over the opponent's replies | 0.5 | +0.173 | +0.247 | 0.466 |
+| network, mean over the opponent's replies | 0.25 | +0.210 | +0.276 | 0.334 |
+| network, mean over the opponent's replies | 0.1875 | +0.224 | +0.285 | 0.275 |
+| **network, mean over the opponent's replies** | **0.125** | **+0.236** | **+0.290** | 0.202 |
+| network, mean over the opponent's replies | 0.0625 | +0.241 | +0.277 | 0.121 |
+| network with a quarter of the handcrafted evaluation mixed in | 0.125 | +0.227 | +0.279 | 0.198 |
 
 (The absolute numbers depend on the dataset; the *ordering* is what matters.
 The same measurement over the positions late in a game, ply 120+, is far
 higher, because the signal is concentrated where the game is actually
 decided.)
 
-Two things in that table are worth keeping in mind.
+Three things in that table are worth keeping in mind.
 
-The search is not what makes the teacher's values good — the leaf is.  With
-the handcrafted evaluation, one ply of search over the opponent's replies
-moves the correlation by three thousandths.  With the network as the leaf, the
-same search is worth six hundredths, and the teacher's values become 39% more
-informative than the handcrafted ones.  This is the largest lever the project
-has, and it is why the Colab notebook puts a network into the teacher half an
-hour into the session rather than after it.
+**The scale of the network is a lever of its own.**  The engine multiplies
+the network's value by ten before it is used as a search score, because the
+network only uses a small part of its range.  Used at that scale the values
+saturate: 74% of them come out at the clamp of [-1,1], their spread is
+0.563 instead of 0.192, and the correlation with the outcome is *worse* than
+the handcrafted teacher's.  Used at an eighth of that scale the same network
+is the best leaf measured: +0.236 against the handcrafted teacher's +0.189.
+The difference between the two settings is not a detail -- it is the
+difference between a teacher that is worth more than the handcrafted one and
+one that is worth less.
 
-The "best reply" aggregation is worse than the mean, and with a network it is
-much worse: the network's value uses only a small part of the [-1,1] range,
-so the maximum over thirty replies saturates at the clamp and the twenty
-per cent of values it produces outside [-0.5, 0.5] say more about the tail
-of the distribution than about the position.
+**The search is not what makes the teacher's values good -- the leaf is.**
+With the handcrafted evaluation, one ply of search over the opponent's
+replies moves the correlation by three thousandths.  With the network as the
+leaf, the same search is worth six hundredths, and the teacher's values
+become 39% more informative than the handcrafted ones.
+
+**Mixing the handcrafted evaluation back in makes it worse.**  A teacher
+whose leaf is three quarters network and a quarter handcrafted scores
++0.227, below the network's own +0.236.  The handcrafted evaluation is not
+a useful correction to a network that has been trained on the same game; it
+is noise added to a signal.
+
+### A bug that was worth more than any of the tuning
+
+The numbers above were measured after a bug was found: `selfplay` and
+`teacher_probe` shared **one** evaluator between all their threads, and the
+evaluator holds the network's feature accumulators, which every evaluation
+changes.  Two threads evaluating at the same time therefore read each
+other's half-finished positions, and the teacher's values came out as a
+mixture of several positions' worth of arithmetic.  Each thread has its own
+evaluator now.
+
+The bug had been quietly making the network look worse than it is.  Before the
+fix, the network's leaf and the handcrafted leaf were indistinguishable; after
+it, the network's leaf at a scale of 0.125 is worth **+0.236** against the
+handcrafted teacher's +0.189 -- a 25% improvement in the quality of the data
+the whole project is made of.  The handcrafted teacher was never affected
+(its evaluation is a pure function of the position), which is why the dataset
+already on disk is still good.
+
+### The teacher on the GPU
+
+The teacher is the bottleneck of this project: every node the search expands
+needs the network evaluated once for every legal move, and the CPU does that
+one evaluation at a time.  The whole teacher can run on the GPU instead.
+
+`engine/gpu/` holds the teacher in a form that compiles both as CUDA and as
+plain C++:
+
+* `jungle_gpu.cuh` — the move generator, written with bitboards.  Every legal
+  move of every piece of a type comes out of one shift and a few masks, and
+  the code is the same whether it runs on one thread or a thousand.
+* `jungle_gpu.cuh` — the network's forward pass, which is the engine's own
+  arithmetic.  It is bit-identical to the engine's: the dot products are
+  sums of products of small integers, which are exact in fp32, and the
+  clipping and rounding steps are the same ones.
+* `jungle_mcts.cuh` — the search, written as a state machine so that a
+  simulation can stop in the middle, ask for the value of a leaf, and carry
+  on when the answer comes back.  That is what lets a thousand games share
+  one batched evaluation.
+* `jungle_game.cuh` — the game loop, writing the same 68-byte records the CPU
+  generator writes.
+* `jungle_gpu_cuda.cu` — the CUDA launcher: one thread per game, the leaf
+  evaluations of a warp's games batched together, `__syncwarp()` and never
+  `__syncthreads()`.
+
+The port is checked against the engine, not assumed to be right:
+
+| check | how | result |
+|---|---|---|
+| the move generator | 80,000 positions from real games, against `engine/src/jungle.hpp` | all agree |
+| the forward pass | 20,000 positions, against the engine's int8 path | worst difference 0 |
+| the teacher's values | 300 positions, the CPU teacher's values against the engine's | 300/300 identical |
+| the CUDA source | type-checked against a shim for the toolkit (`scripts/check_cuda_syntax.py`) | passes |
+
+The values are checked value by value with the root's noise turned off, which
+makes both teachers deterministic: the GPU teacher's root value matches the
+engine's to the last decimal on every position.
+
+How many games to run at once is measured, not chosen.  `engine/gpu/gpu_selfplay.py`
+asks the compiled code how much video memory a game needs, works out how many
+fit in the card, then runs each candidate number and measures the positions
+per second -- the games finish at different times, so the batch waits for the
+slowest lane, and past a point more games stop helping.  The number it
+recommends is written to `runs/gpu/autotune.json` and the generator reads it
+from there.  Nothing in the notebook hard-codes a batch size.
 
 Generate data:
 
@@ -134,9 +211,16 @@ With a network as the teacher's leaf:
 
 ```bash
 ./build/selfplay --games 5000 --threads 8 --sims 800 \
-                 --nnue ../net/net.nnue --leaf-scale 1.0 \
+                 --nnue ../net/net.nnue --leaf-scale 0.125 \
                  --leaf-depth 1 --leaf-agg 1 --c-puct 1.4 \
                  --out ../data/round1/data
+```
+
+On the GPU, the same teacher:
+
+```bash
+python3 engine/gpu/gpu_selfplay.py --net net/net.nnue --out data/gpu/data.t0.bin \
+                                    --games 4096 --sims 800
 ```
 
 Each thread writes its own shard, `data/data.t<N>.bin`, 68 bytes per
@@ -279,19 +363,23 @@ learned its target as well as the target can be learned.  So a third of the
 information comes from the teacher's search and two thirds from the game's
 result — and the result is the only ground truth there is.
 
-**As a player.**  400 games against the handcrafted engine, one second per
-move, the colours alternating from game to game:
+**As a player.**  Against the handcrafted engine, the colours alternating from
+game to game:
 
-| | |
-|---|---|
-| neural engine | **202 wins, 13 losses, 185 draws** |
-| score | **0.736**, 95% confidence interval **[0.693, 0.779]** |
-| Elo | **+178** |
-| decisive games | 93.9% won, 95% confidence interval [0.908, 0.971] |
+| seconds per move | games | neural engine | score | Elo |
+|---|---|---|---|---|
+| 1 | 400 | 202 W, 13 L, 185 D | 0.736 (95% CI [0.693, 0.779]) | **+178** |
+| 3 | 200 | **170 W, 0 L, 30 D** | 0.925 (95% CI [0.889, 0.962]) | **+436** |
 
-Every one of the 215 decisive games was won by entering the opponent's den,
-which is how the game is supposed to be won; the other 185 ended in a
-three-fold repetition.
+At one second per move the neural engine wins 93.9% of the decisive games
+(95% CI [0.908, 0.971]).  At three seconds it wins *every* decisive game —
+170 out of 170, with no losses at all — and the gap widens rather than
+narrowing, because the extra time lets the network's evaluation pay off while
+the handcrafted engine has nothing more to gain from it.
+
+Every decisive game in both matches was won by entering the opponent's den,
+which is how the game is supposed to be won; the rest ended in a three-fold
+repetition.
 
 The network width is a trade-off, and it is worth being explicit about it.
 A wider network predicts slightly better but evaluates more slowly, and at a
@@ -376,7 +464,13 @@ engine/
   src/search.hpp      iterative-deepening alpha-beta with a transposition table
   src/engine_api.hpp  one interface over alpha-beta and MCTS
   tools/              selfplay, match, dump_moves, eval_nnue, nnue_check, bench,
-                      teacher_probe
+                      teacher_probe, nnue_ref
+  gpu/                the teacher, written so that it compiles as CUDA and as C++
+    jungle_gpu.cuh    bitboard move generator, the network's forward pass
+    jungle_mcts.cuh   the search, as a resumable state machine
+    jungle_game.cuh   the game loop, writing the engine's 68-byte records
+    jungle_gpu_cuda.cu  the CUDA launcher
+    gpu_selfplay.py   the driver and the auto-tuner
 train/
   dataset.py          shard reader
   model.py            quantisation-aware NNUE
@@ -392,6 +486,8 @@ scripts/
   eval_teacher_quality.py  how well the teacher's values predict the outcome
   eval_teacher_configs.py  compare teacher configurations on the same positions
   eval_net_quality.py      how well a network predicts the outcome
+  check_cuda_syntax.py     type-check the CUDA source without a CUDA toolkit
+  gpu_selfplay_loop.sh     the GPU generator, in the background
   verify_all.sh       everything the CI checks
   make_colab_notebook.py
 colab/

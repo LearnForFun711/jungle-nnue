@@ -27,7 +27,12 @@ MINUTES="${2:?usage: expert_iteration.sh <net.nnue> <minutes> [outdir]}"
 OUT="${3:-data/round/data}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 4)}"
 SIMS="${SIMS:-800}"
-LEAF_SCALE="${LEAF_SCALE:-1.0}"
+# The leaf scale was measured, not guessed: at 1.0 the network's value is
+# clipped most of the way and the teacher's values stop being
+# discriminative (correlation with the result 0.15); at 0.125 they
+# are the best of any setting tried (0.236 against the handcrafted
+# teacher's 0.189).
+LEAF_SCALE="${LEAF_SCALE:-0.125}"
 
 if [ ! -f "$NET" ]; then
     echo "no such network: $NET" >&2
