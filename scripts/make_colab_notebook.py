@@ -251,7 +251,27 @@ without a GPU, a driver that does not match the toolkit -- the notebook
 carries on with the CPU generator and nothing else changes.
 """),
     code("""
-import ctypes, glob, os, shutil, subprocess, sys, traceback
+import ctypes, glob, os, shutil, subprocess, sys, traceback, urllib.request
+
+# --- get the GPU sources -----------------------------------------------------
+# nvcc has a rule the plain C++ compiler does not: a function called from
+# device code has to be a device function itself.  The move generator calls
+# piece_type() and feature_index(), and if those are not marked for the
+# device, nvcc rejects the file and the .cu never compiles.  The sources are
+# fetched from GitHub so that a clone made before the fix cannot be the one
+# that is built.
+GPU_DIR = os.path.abspath(os.path.join("engine", "gpu"))
+RAW = "https://raw.githubusercontent.com/LearnForFun711/jungle-nnue/main/engine/gpu/"
+for name in ("jungle_gpu.h", "jungle_gpu.cuh", "jungle_mcts.cuh", "jungle_game.cuh",
+             "jungle_gpu_common.cpp", "jungle_gpu_cuda.cu"):
+    try:
+        with urllib.request.urlopen(RAW + name, timeout=60) as response:
+            data = response.read()
+        with open(os.path.join(GPU_DIR, name), "wb") as f:
+            f.write(data)
+        print(f"  {name:24s} {len(data):7d} bytes")
+    except Exception as exc:
+        print(f"  {name:24s} could not fetch: {exc}")
 
 # Colab does not set CUDA_HOME, and torch needs it.  Without it torch cannot
 # find the CUDA runtime to link the extension against: the shared object is
@@ -276,17 +296,46 @@ print("CUDA_HOME =", os.environ.get("CUDA_HOME"))
 if shutil.which("ninja") is None:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"], check=False)
 
-sys.path.insert(0, os.path.join("engine", "gpu"))
-import gpu_selfplay
+import torch
+from torch.utils.cpp_extension import load
+
+BUILD = "/content/jungle-gpu-build"
+shutil.rmtree(BUILD, ignore_errors=True)      # no stale objects from a failed run
+os.makedirs(BUILD, exist_ok=True)
 
 EXT = None
-if torch.cuda.is_available():
-    EXT = gpu_selfplay.build_extension()
+if not torch.cuda.is_available():
+    print("no CUDA device -- the CPU teacher will be used")
+else:
+    try:
+        EXT = load(
+            name="jungle_gpu_selfplay",
+            sources=[os.path.join(GPU_DIR, "jungle_gpu_cuda.cu"),
+                     os.path.join(GPU_DIR, "jungle_gpu_common.cpp")],
+            extra_cflags=["-O3", "-std=c++17"],
+            # No --use_fast_math: the forward pass has to give the same
+            # numbers as the engine's.
+            extra_cuda_cflags=["-O3", "-lineinfo"],
+            extra_include_paths=[GPU_DIR],
+            build_directory=BUILD,
+            verbose=True,
+        )
+    except Exception as exc:
+        # The compiler's message is inside the exception, not in the one line
+        # the traceback ends with.
+        print("=" * 30, "THE BUILD FAILED")
+        print(str(exc)[:12000])
+        cause = exc.__cause__
+        while cause is not None:
+            print("=" * 30, "CAUSE")
+            print(str(cause)[:12000])
+            cause = cause.__cause__
+        traceback.print_exc()
+
     if EXT is None:
         # The shared object may have been built but would not load, because
         # the CUDA runtime is not on the loader's search path.  Loading the
         # runtime by its full path first puts it in the process for good.
-        so = os.path.join("engine", "buildgpu", "torch", "jungle_gpu_selfplay.so")
         cuda_lib = os.path.join(os.environ.get("CUDA_HOME", "/usr/local/cuda"), "lib64")
         for lib in ("libcudart.so.12", "libcudart.so.11.0", "libcudart.so"):
             path = os.path.join(cuda_lib, lib)
@@ -296,18 +345,28 @@ if torch.cuda.is_available():
                     print("preloaded", path)
                 except OSError as exc:
                     print("could not preload", path, exc)
-        if os.path.exists(so):
+
+        for so in glob.glob(os.path.join(BUILD, "*.so")):
             import importlib.util
+            module_name = os.path.basename(so).split(".")[0]
             try:
-                spec = importlib.util.spec_from_file_location("jungle_gpu_selfplay", so)
+                spec = importlib.util.spec_from_file_location(module_name, so)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 EXT = module
-                print("the extension was loaded directly")
-            except Exception:
-                traceback.print_exc()
-else:
-    print("no CUDA device: the CPU teacher will be used")
+                print("the extension was loaded directly from", so)
+                break
+            except Exception as exc:
+                print("could not load", so, exc)
+
+    if EXT is None:
+        for path in (glob.glob(os.path.join(BUILD, "*.log"))
+                     + [os.path.join(BUILD, ".ninja_log")]):
+            if os.path.exists(path):
+                print("=" * 30, path)
+                with open(path, errors="replace") as f:
+                    print(f.read()[-4000:])
+
 print("GPU teacher:", "ready" if EXT is not None else "not available")
 """),
     md("""

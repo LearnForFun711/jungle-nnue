@@ -1,26 +1,26 @@
 # Cell 5a -- put the teacher on the GPU.
 #
 # Copy this cell into Colab and run it in place of the notebook's own 5a.
-# It is self-contained: it does not need the repository to have been
-# updated, so it works with a clone that predates the fix.
 #
-# What went wrong before: Colab does not set CUDA_HOME, and torch needs it.
-# Without it torch cannot find the CUDA runtime to link the extension
-# against, the shared object is built without the runtime's path in it, and
-# the import fails with "cannot open shared object file" -- which says
-# nothing about what is actually wrong.  The cell below sets CUDA_HOME,
-# makes sure ninja is there, builds the extension, and if the import still
-# fails it loads the runtime by its full path and tries again.
+# Two things went wrong before, and both are handled here.
 #
-# There was a second reason, found once the first was out of the way: nvcc
-# has a rule the plain C++ compiler does not, and a function called from
-# device code has to be a device function itself.  The move generator
-# called piece_type() and feature_index(), and neither was marked, so the
-# .cu file did not compile at all.  That is fixed in the repository, and
-# the pull at the top of this cell brings it in.
+# 1. Colab does not set CUDA_HOME, and torch needs it.  Without it torch
+#    cannot find the CUDA runtime to link the extension against, the shared
+#    object is built without the runtime's path in it, and the import fails
+#    with "cannot open shared object file" -- which says nothing about what
+#    is wrong.
 #
-# If it still does not work, the last thing the cell prints is the build log.
-# Paste that back and it will say what is wrong.
+# 2. nvcc has a rule the plain C++ compiler does not: a function called from
+#    device code has to be a device function itself.  The move generator
+#    called piece_type() and feature_index(), and neither was marked, so
+#    nvcc rejected the file.  This is the "GPU function calling a CPU
+#    function" error, and it is a compile error, not a runtime one.
+#
+# The cell fetches the fixed sources straight from GitHub rather than
+# pulling: the clone in a notebook is shallow, and a pull in it can fail
+# silently.  If the fetch works, the build should work; if it does not,
+# the cell prints the compiler's own message, which is the part that
+# matters.
 
 import ctypes
 import glob
@@ -29,19 +29,27 @@ import shutil
 import subprocess
 import sys
 import traceback
+import urllib.request
 
-# --- 0. get the fix ----------------------------------------------------------
-# The functions the kernels call have to be marked for the device, or nvcc
-# refuses to compile the file.  If this clone is older than that fix, pull
-# it; if the pull does not work, carry on and the build log will say why.
-try:
-    subprocess.run(["git", "pull", "--ff-only"], capture_output=True, timeout=120)
-    print("git pull:", subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                                      capture_output=True, text=True).stdout.strip())
-except Exception:
-    pass
+GPU_DIR = os.path.abspath(os.path.join("engine", "gpu"))
+RAW = "https://raw.githubusercontent.com/LearnForFun711/jungle-nnue/main/engine/gpu/"
+SOURCES = ("jungle_gpu.h", "jungle_gpu.cuh", "jungle_mcts.cuh", "jungle_game.cuh",
+           "jungle_gpu_common.cpp", "jungle_gpu_cuda.cu")
 
-# --- 1. find the CUDA toolkit ------------------------------------------------
+# --- 1. get the fixed sources ------------------------------------------------
+print("--- fetching the GPU sources ---")
+for name in SOURCES:
+    try:
+        with urllib.request.urlopen(RAW + name, timeout=60) as response:
+            data = response.read()
+        with open(os.path.join(GPU_DIR, name), "wb") as f:
+            f.write(data)
+        print(f"  {name:24s} {len(data):7d} bytes")
+    except Exception as exc:
+        print(f"  {name:24s} COULD NOT FETCH: {exc}")
+print("  (if these were fetched, the sources are the fixed ones)")
+
+# --- 2. the CUDA toolkit and ninja -------------------------------------------
 if not os.environ.get("CUDA_HOME"):
     candidates = ["/usr/local/cuda"]
     try:
@@ -56,16 +64,15 @@ if not os.environ.get("CUDA_HOME"):
             break
 print("CUDA_HOME =", os.environ.get("CUDA_HOME"))
 
-# --- 2. ninja ---------------------------------------------------------------
 if shutil.which("ninja") is None:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"], check=False)
 
-# --- 3. build ---------------------------------------------------------------
+# --- 3. build -----------------------------------------------------------------
 import torch
 from torch.utils.cpp_extension import load
 
-GPU_DIR = os.path.abspath(os.path.join("engine", "gpu"))
 BUILD = "/content/jungle-gpu-build"
+shutil.rmtree(BUILD, ignore_errors=True)      # no stale objects from a failed run
 os.makedirs(BUILD, exist_ok=True)
 
 EXT = None
@@ -85,7 +92,16 @@ else:
             build_directory=BUILD,
             verbose=True,
         )
-    except Exception:
+    except Exception as exc:
+        # The compiler's message is inside the exception, not in the one
+        # line the traceback ends with.  Print all of it.
+        print("=" * 30, "THE BUILD FAILED")
+        print(str(exc)[:12000])
+        cause = exc.__cause__
+        while cause is not None:
+            print("=" * 30, "CAUSE")
+            print(str(cause)[:12000])
+            cause = cause.__cause__
         traceback.print_exc()
 
     if EXT is None:
@@ -102,20 +118,20 @@ else:
                 except OSError as exc:
                     print("could not preload", path, exc)
 
-        so = os.path.join(BUILD, "jungle_gpu_selfplay.so")
-        if os.path.exists(so):
+        for so in glob.glob(os.path.join(BUILD, "*.so")):
             import importlib.util
+            module_name = os.path.basename(so).split(".")[0]
             try:
-                spec = importlib.util.spec_from_file_location("jungle_gpu_selfplay", so)
+                spec = importlib.util.spec_from_file_location(module_name, so)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
                 EXT = module
-                print("the extension was loaded directly")
-            except Exception:
-                traceback.print_exc()
+                print("the extension was loaded directly from", so)
+                break
+            except Exception as exc:
+                print("could not load", so, exc)
 
     if EXT is None:
-        # The one-line error hides the reason; the build log has it.
         for path in (glob.glob(os.path.join(BUILD, "*.log"))
                      + [os.path.join(BUILD, ".ninja_log")]):
             if os.path.exists(path):
