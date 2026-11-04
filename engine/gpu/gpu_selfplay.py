@@ -196,7 +196,8 @@ def run_once(module, net, out_path, games, sims=DEFAULT_SIMS, seed=12345,
 
 
 def autotune(module, net, budget_gb=40.0, sims=DEFAULT_SIMS, out_dir=None,
-             candidates=None, seed=12345, leaf_scale=DEFAULT_LEAF_SCALE):
+             candidates=None, seed=12345, leaf_scale=DEFAULT_LEAF_SCALE,
+             tune_sims=200, max_candidates=4096):
     """Measure the throughput curve and work out the best number of games.
 
     The curve is measured, not guessed: each candidate number of games is
@@ -204,6 +205,19 @@ def autotune(module, net, budget_gb=40.0, sims=DEFAULT_SIMS, out_dir=None,
     the program recommends is the one that reaches the best rate -- and,
     when several do, the smallest of them, because a smaller number leaves
     more room for the other things the card has to do.
+
+    Two things are kept apart on purpose.
+
+    The *memory model* says how many games fit.  On a 40 GB card that is
+    hundreds of thousands, and measuring a run of that size would take
+    hours, so the curve is measured at a few thousand games and the memory
+    limit is reported next to it.
+
+    The *curve* says how many games the chip can keep busy.  That is a good
+    deal fewer than fit, because the games finish at different times and a
+    batch has to wait for the slowest lane in the warp.  The sweep uses
+    fewer simulations a move than the real generator, so that each point
+    costs a few seconds rather than a few minutes.
     """
     out_dir = out_dir or os.path.join(ROOT, "runs", "gpu")
     os.makedirs(out_dir, exist_ok=True)
@@ -228,24 +242,27 @@ def autotune(module, net, budget_gb=40.0, sims=DEFAULT_SIMS, out_dir=None,
     print(f"  games that fit     : {fits}")
 
     if candidates is None:
-        # Start from the number that fits, and halve it until the curve
-        # has turned over: the point where more games stop helping.
+        # Powers of two up to the point where the curve has certainly
+        # turned over.  Measuring beyond that would cost minutes per point
+        # and tell us nothing the curve has not already said.
         candidates = []
-        n = fits
-        while n >= 32 and len(candidates) < 12:
-            candidates.append(int(n))
-            n //= 2
+        n = 128
+        while n <= max_candidates and n <= fits:
+            candidates.append(n)
+            n *= 2
+        if fits < 128:
+            candidates = [max(32, fits)]
         candidates = sorted(set(candidates))
 
     print()
-    print("== the measured curve ==")
+    print(f"== the measured curve ({tune_sims} simulations a move, so each point is quick) ==")
     print(f"  {'games':>8}  {'seconds':>8}  {'positions':>11}  {'positions/s':>12}  {'games/s':>9}")
     rows = []
     for games in candidates:
         if games > fits:
             continue
         path = os.path.join(out_dir, f"tune_{games}.bin")
-        stats = run_once(module, net, path, games, sims=sims, seed=seed,
+        stats = run_once(module, net, path, games, sims=tune_sims, seed=seed,
                          leaf_scale=leaf_scale)
         positions = int(stats["positions"])
         seconds = float(stats["seconds"])
@@ -279,7 +296,10 @@ def autotune(module, net, budget_gb=40.0, sims=DEFAULT_SIMS, out_dir=None,
     print(f"  video memory used   : "
           f"{chosen['games'] * model['bytes_per_game_total'] / 2**30:.2f} GB of "
           f"{budget/2**30:.1f} GB")
-    print(f"  with {sims} simulations a move")
+    print(f"  the memory would allow {fits} games; the chip runs out of work to do "
+          f"long before that.")
+    print(f"  the generator will use {sims} simulations a move "
+          f"(the sweep above used {tune_sims})")
     result = {"chosen_games": chosen["games"], "sims": sims,
               "positions_per_second": chosen["positions_per_second"],
               "budget_bytes": budget, "fits": int(fits),
@@ -358,6 +378,9 @@ def main():
     ap.add_argument("--tune", action="store_true", help="measure the best number of games")
     ap.add_argument("--budget-gb", type=float, default=40.0)
     ap.add_argument("--candidates", type=int, nargs="*", default=None)
+    ap.add_argument("--tune-sims", type=int, default=200,
+                    help="simulations a move during the sweep (the real "
+                         "generator uses --sims)")
     ap.add_argument("--parity", action="store_true", help="check the GPU against the CPU")
     args = ap.parse_args()
 
@@ -371,7 +394,8 @@ def main():
 
     if args.tune:
         autotune(module, args.net, budget_gb=args.budget_gb, sims=args.sims,
-                 candidates=args.candidates, seed=args.seed, leaf_scale=args.leaf_scale)
+                 candidates=args.candidates, seed=args.seed,
+                 leaf_scale=args.leaf_scale, tune_sims=args.tune_sims)
 
     if args.games > 0 and not args.tune:
         os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

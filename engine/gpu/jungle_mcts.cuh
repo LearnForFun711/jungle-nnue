@@ -26,11 +26,11 @@ namespace jungle_gpu {
 constexpr uint32_t kNoChild = 0xFFFFFFFFu;
 
 // How many nodes one game's tree may hold.  A search of `sims` simulations
-// creates at most one node per simulation, plus the root's children, so a
+// creates at most one node per simulation, plus the root's children, so two
 // thousand simulations fit.  When the tree is full no more children are
 // created and the search falls back on the node's leaf value, which is what
 // the CPU teacher does when it runs out of nodes as well.
-constexpr int MAX_NODES = 1024;
+constexpr int MAX_NODES = 2048;
 
 struct GpuNode {
     float    value_sum = 0.f;   // the values backed up, from this node's view
