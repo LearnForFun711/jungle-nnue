@@ -439,6 +439,66 @@ toss, and it is how a weaker network ends up being the one that is shipped.
 So the notebook does it in two rounds: a short match for every candidate, and
 then a long one — three hundred games at half a second — for the best few.
 
+### The rule that shipped the wrong network
+
+The candidate that goes into `/content/net.nnue` used to be chosen by the
+**lowest validation loss**, and that rule was not just a poor proxy — it was
+actively wrong, and it picked the weakest candidate every time.
+
+The training target is a blend:
+
+```
+target = (1 - w) * teacher_value + w * game_result
+```
+
+`w` is the `result_weight` of the configuration.  The validation loss is the
+mean squared error against that target, and it is **not comparable between
+configurations with different `w`**.  The game result is a step function at
+the end of the game: no network can predict it from a single position, so
+every extra weight on it raises the MSE floor of a *perfect* network.  The
+target variance on the training data:
+
+| `result_weight` | 0.00 | 0.25 | 0.50 | 0.75 |
+|---|---|---|---|---|
+| target variance | 0.034 | 0.048 | 0.102 | 0.198 |
+
+"Lowest validation loss" therefore always means "smallest `w`", i.e. the
+candidate that imitates the teacher most closely.  The teacher is a ceiling,
+so that candidate is the weakest one — and the pipeline was throwing away
+the `w=0.75` network, which is the one trained to actually look at who won.
+
+The selection is now made on the **correlation between the network's value
+and the game outcome**.  It is measured on the same validation positions for
+every candidate, it does not depend on the target blend, and it is what
+playing strength follows.  On the same 8,000 positions:
+
+| | correlation with the outcome |
+|---|---|
+| handcrafted evaluation | +0.206 |
+| GPU teacher (the ceiling for a pure imitator) | +0.241 |
+| the network that was shipped | +0.243 |
+| the strong network | +0.384 |
+
+The shipped network sat *exactly* on the teacher's ceiling: it was a faithful
+copy of the teacher, and a faithful copy of the teacher cannot be better than
+the teacher.  `--select-by corr` is the default now, and every run also
+keeps a `best_corr.pt` checkpoint next to the `best.pt` one, because a
+network can have a falling validation loss and a falling correlation at the
+same time.
+
+`scripts/diagnose_net.py` measures all of this for a network you already
+have:
+
+```bash
+python3 scripts/diagnose_net.py --net net/net-new.nnue --compare net/net.nnue
+```
+
+It reports the output magnitude, the calibration curve and the sign accuracy
+per phase.  The calibration curve is worth looking at: the shipped network
+was over-confident in the band that decides games, predicting +0.174 where
+the true outcome was +0.049, while the strong network's error in that band
+was under 0.025.
+
 ---
 
 ## Training on Colab

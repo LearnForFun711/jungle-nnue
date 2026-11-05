@@ -538,6 +538,25 @@ Note that the network with the lowest validation loss is not automatically
 the strongest one: a wider network evaluates more accurately but also more
 slowly, and at a fixed clock the slower engine searches less deeply.  Every
 candidate is exported so they can be compared by playing strength.
+
+**Which candidate is exported as `net.nnue` matters, and the rule is not the
+one you would guess.**  The validation loss cannot be compared between
+configurations that use different `result_weight`s, because the target is
+
+    (1 - w) * teacher_value + w * game_result
+
+and the game result is a step function at the end of the game: no network can
+predict it from a single position, so every extra weight on it raises the
+MSE floor of a *perfect* network.  Measured on this dataset the target
+variance is 0.034 at w=0.00, 0.048 at w=0.25, 0.102 at w=0.50 and 0.198 at
+w=0.75 -- so "the lowest validation loss" is always the *smallest* w, i.e.
+the candidate that imitates the teacher most closely.  The teacher is a
+ceiling, so that rule systematically ships the weakest network.
+
+The selection is therefore made on the **correlation with the game outcome**,
+which is measured on the same validation positions for every candidate and
+does not depend on the target blend.  That is the number that tracks playing
+strength, and it is what `--select-by corr` uses.
 """),
     code("""
 import os, sys, time
@@ -551,7 +570,7 @@ print(f"budget={BUDGET_MINUTES} min  configs={CONFIGS}  batch={BATCH}  lr={LR}")
 t0 = time.time()
 !{sys.executable} train/train_budget.py --data "data/**/*.bin" \\
     --out runs/budget --minutes {BUDGET_MINUTES} --configs "{CONFIGS}" \\
-    --batch {BATCH} --lr {LR} --best-out /content/net.nnue
+    --batch {BATCH} --lr {LR} --best-out /content/net.nnue --select-by corr
 print("training took %.1f minutes" % ((time.time() - t0) / 60))
 """),
     md("""
@@ -661,6 +680,22 @@ def play(net, games, seconds):
         return None
 
 
+def corr_of(name):
+    # The correlation with the game outcome that the training run measured for
+    # this candidate.  It is free (the training loop already computed it) and
+    # it is the metric that tracks playing strength, so it is printed next to
+    # the match score.
+    stem = name[:-5] if name.endswith(".nnue") else name
+    for candidate_stem in (stem, stem.replace("-imitation", "")):
+        for path in glob.glob("runs/budget/*/history.json"):
+            if os.path.basename(os.path.dirname(path)) == candidate_stem:
+                try:
+                    return json.load(open(path)).get("best_corr")
+                except Exception:
+                    return None
+    return None
+
+
 # First round: every candidate, a short match.  This is only a filter --
 # sixty games cannot tell two close candidates apart, and picking the winner
 # of it means picking a coin toss.  A network that lost the coin toss here
@@ -674,16 +709,20 @@ for net in sorted(glob.glob("/content/candidates/*.nnue")):
     if d is None:
         continue
     score = d["score_a"]
+    c = corr_of(name)
+    ctxt = f"   corr(outcome) {c:+.4f}" if c is not None else ""
     print(f"    {d['a_wins']} W / {d['b_wins']} L / {d['draws']} D   "
           f"score {score:.3f}   Elo {d['elo_a']:+.1f}   "
-          f"decisive {d.get('decisive_score_a', float('nan')):.3f}")
+          f"decisive {d.get('decisive_score_a', float('nan')):.3f}{ctxt}")
     results.append((score, name, net))
 
 if results:
     results.sort(reverse=True)
     print("\\n=== the candidates, strongest first (the short match) ===")
     for score, name, net in results:
-        print(f"    {score:.3f}  {name}")
+        c = corr_of(name)
+        ctxt = f"   corr {c:+.4f}" if c is not None else ""
+        print(f"    {score:.3f}  {name}{ctxt}")
 
     # Second round: the best few, a much longer match.  This is the one that
     # decides.
@@ -706,13 +745,16 @@ if results:
 
     print("\\n=== the candidates, strongest first ===")
     for score, name, net in results:
-        print(f"    {score:.3f}  {name}")
+        c = corr_of(name)
+        ctxt = f"   corr {c:+.4f}" if c is not None else ""
+        print(f"    {score:.3f}  {name}{ctxt}")
     best = results[0]
     shutil.copyfile(best[2], "/content/net-strongest.nnue")
     shutil.copyfile(best[2], "/content/net.nnue")
     print(f"\\nstrongest: {best[1]}  ->  /content/net-strongest.nnue")
     with open("/content/strength.json", "w") as f:
-        json.dump([{"name": n, "score": sc} for sc, n, _ in results], f, indent=2)
+        json.dump([{"name": n, "score": sc, "corr": corr_of(n)}
+                   for sc, n, _ in results], f, indent=2)
 else:
     print("no candidates were measured")
 """),
@@ -725,18 +767,31 @@ and the architecture metadata.  The C++ engine reads it directly.
     code("""
 import glob, os, shutil
 
-# Every candidate, plus the best one by validation loss.
+# Every candidate.  Two per configuration, because they answer different
+# questions:
+#
+#   <name>.nnue      -- the checkpoint with the lowest validation loss, i.e.
+#                       the best imitation of the training target.
+#   <name>-corr.nnue -- the checkpoint with the highest correlation with the
+#                       game outcome, i.e. the best *player*.
+#
+# Within one configuration the two are usually the same epoch.  Across
+# configurations, and even within one, they are not always: a network can
+# have a falling validation loss and a falling correlation at the same time,
+# and only the second one is playing strength.  The candidates that go into
+# the match below are the corr ones, because the match is what decides.
 os.makedirs("/content/candidates", exist_ok=True)
-for net in sorted(glob.glob("runs/budget/*/net.nnue")):
-    shutil.copyfile(net, os.path.join("/content/candidates", os.path.basename(os.path.dirname(net)) + ".nnue"))
+for net in sorted(glob.glob("runs/budget/*/net-corr.nnue")):
+    name = os.path.basename(os.path.dirname(net))
+    shutil.copyfile(net, os.path.join("/content/candidates", name + ".nnue"))
     print("candidate:", net)
 
+# The best-imitation checkpoints are kept as well, with a different name, so
+# that the two can be compared by playing strength if wanted.
 for net in sorted(glob.glob("runs/budget/*/net.nnue")):
-    ck = net.replace("/net.nnue", "/best.pt")
-    if os.path.exists(ck):
-        out = "/content/candidates/" + os.path.basename(os.path.dirname(net)) + ".nnue"
-        subprocess_ok = os.system(f"python3 train/export_nnue.py --checkpoint {ck} --out {out}") == 0
-        print("re-exported", out, "ok" if subprocess_ok else "FAILED")
+    name = os.path.basename(os.path.dirname(net))
+    shutil.copyfile(net, os.path.join("/content/candidates", name + "-imitation.nnue"))
+    print("candidate (by validation loss):", net)
 
 print()
 print("best net:", "/content/net.nnue",

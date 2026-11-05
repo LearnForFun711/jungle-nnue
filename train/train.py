@@ -241,6 +241,11 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_val = float("inf")
+    # The best checkpoint by *playing strength* rather than by imitation.
+    # The correlation with the game outcome is the only metric that is
+    # comparable between runs that use different target blends, so it gets
+    # its own checkpoint.
+    best_corr = -2.0
     curve = []
     step = 0
     start = time.time()
@@ -391,12 +396,21 @@ def main():
                         "corr": corr},
                        os.path.join(args.out, "best.pt"))
             print(f"  new best val_loss {val:.6f}", flush=True)
+        if corr > best_corr:
+            best_corr = corr
+            torch.save({"model": model.state_dict(), "ft_hidden": args.ft_hidden,
+                        "hidden": args.hidden, "epoch": epoch, "val_loss": val,
+                        "corr": corr},
+                       os.path.join(args.out, "best_corr.pt"))
+            print(f"  new best corr(outcome) {corr:+.4f}", flush=True)
 
         curve.append({"epoch": epoch, "val_loss": val, "corr": corr,
-                      "best": best_val, "minutes": (time.time() - start) / 60})
+                      "best": best_val, "best_corr": best_corr,
+                      "minutes": (time.time() - start) / 60})
         with open(os.path.join(args.out, "history.json"), "w") as f:
             json.dump({"epoch": epoch, "val_loss": val, "corr": corr,
-                       "best": best_val, "minutes": (time.time() - start) / 60,
+                       "best": best_val, "best_corr": best_corr,
+                       "minutes": (time.time() - start) / 60,
                        "curve": curve}, f, indent=2)
 
         if stop:

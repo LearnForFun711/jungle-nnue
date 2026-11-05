@@ -67,7 +67,12 @@ def main():
                     help="how many slices to split the budget into "
                          "(0 = one per configuration)")
     ap.add_argument("--best-out", default="",
-                    help="where to copy the best network (by validation loss)")
+                    help="where to copy the best network")
+    ap.add_argument("--select-by", default="corr", choices=("corr", "val_loss"),
+                    help="how to pick the network for --best-out: 'corr' "
+                         "(correlation with the game outcome, the default and "
+                         "the only metric that is comparable between "
+                         "configurations) or 'val_loss' (the old rule)")
     args = ap.parse_args()
 
     configs = parse_configs(args.configs)
@@ -113,24 +118,41 @@ def main():
         elapsed = (time.time() - t0) / 60
 
         val_loss = None
+        corr = None
         hist_path = os.path.join(outdir, "history.json")
         if os.path.exists(hist_path):
             try:
                 with open(hist_path) as f:
-                    val_loss = json.load(f).get("best")
+                    hist = json.load(f)
+                val_loss = hist.get("best")
+                corr = hist.get("best_corr")
             except (ValueError, OSError):
                 pass
 
+        # Two checkpoints per run, because they answer different questions.
+        #   best.pt      -- the best imitation of the training target.
+        #   best_corr.pt -- the best predictor of who actually won.
+        # For a *single* configuration the two usually agree.  Across
+        # configurations they do not, and the second is the one that decides
+        # how strong the engine is.
         if proc.returncode == 0 and os.path.exists(os.path.join(outdir, "best.pt")):
             subprocess.run([sys.executable, os.path.join(HERE, "export_nnue.py"),
                             "--checkpoint", os.path.join(outdir, "best.pt"),
                             "--out", net_path], cwd=ROOT, check=True)
             print(f"    exported {net_path}", flush=True)
+            corr_ckpt = os.path.join(outdir, "best_corr.pt")
+            if os.path.exists(corr_ckpt):
+                subprocess.run([sys.executable, os.path.join(HERE, "export_nnue.py"),
+                                "--checkpoint", corr_ckpt,
+                                "--out", net_path.replace(".nnue", "-corr.nnue")],
+                               cwd=ROOT, check=True)
+                print(f"    exported {net_path.replace('.nnue', '-corr.nnue')}",
+                      flush=True)
         else:
             print(f"    run failed (exit {proc.returncode})", flush=True)
 
         summary.append({"name": name, "ft_hidden": ft, "hidden": hid,
-                        "result_weight": rw, "val_loss": val_loss,
+                        "result_weight": rw, "val_loss": val_loss, "corr": corr,
                         "minutes": round(elapsed, 2),
                         "positions": positions, "net": net_path})
         with open(summary_path, "w") as f:
@@ -139,15 +161,70 @@ def main():
     print(f"\n==> budget spent after {(time.time()-t_start)/60:.1f} min")
     for s in summary:
         vl = f"{s['val_loss']:.6f}" if s["val_loss"] is not None else "n/a"
-        print(f"    {s['name']:<24} val_loss {vl}   {s['minutes']:.1f} min")
+        cr = f"{s['corr']:+.4f}" if s.get("corr") is not None else "n/a"
+        print(f"    {s['name']:<24} val_loss {vl}   corr {cr}   "
+              f"{s['minutes']:.1f} min")
 
     if args.best_out:
-        good = [s for s in summary if s["val_loss"] is not None]
-        if good:
-            best = min(good, key=lambda s: s["val_loss"])
-            import shutil
-            shutil.copyfile(best["net"], args.best_out)
-            print(f"\n==> best by validation loss: {best['name']} -> {args.best_out}")
+        # The selection metric matters here.
+        #
+        # The validation loss is *not* comparable between configurations that
+        # use different target blends.  The target is
+        #
+        #     (1 - w) * teacher_value + w * game_result
+        #
+        # and the game result is a step function at the end of the game: it
+        # cannot be predicted from a single position, so every extra weight on
+        # it raises the MSE floor of a *perfect* network.  Measured on the
+        # training data, the target variance is 0.034 at w=0.00, 0.048 at
+        # w=0.25, 0.102 at w=0.50 and 0.198 at w=0.75.  Choosing the smallest
+        # validation loss therefore always picks the smallest w, i.e. the
+        # candidate that imitates the teacher most closely -- and the teacher
+        # is a ceiling, so that candidate is the *weakest* one.  That is not a
+        # subtle effect: it is the selection rule shipping the wrong network.
+        #
+        # The correlation between the network's value and the game result is
+        # measured on the same validation positions for every candidate and
+        # does not depend on the target blend, so it can be compared across
+        # configurations.  It is also what playing strength follows: the
+        # handcrafted evaluation correlates +0.21 with the outcome on the
+        # same data and the strong network +0.38, and the engine's Elo
+        # follows the same order.
+        if args.select_by == "corr":
+            good = [s for s in summary if s.get("corr") is not None]
+            if good:
+                best = max(good, key=lambda s: s["corr"])
+                import shutil
+                src = best["net"].replace(".nnue", "-corr.nnue")
+                if not os.path.exists(src):
+                    src = best["net"]
+                shutil.copyfile(src, args.best_out)
+                print(f"\n==> best by correlation with the outcome: "
+                      f"{best['name']} (corr {best['corr']:+.4f}, "
+                      f"result_weight {best['result_weight']}) -> {args.best_out}")
+
+                by_loss = [s for s in summary if s["val_loss"] is not None]
+                if by_loss:
+                    bl = min(by_loss, key=lambda s: s["val_loss"])
+                    if bl["name"] != best["name"]:
+                        print(f"    (note: the lowest validation loss was "
+                              f"{bl['name']}, val_loss {bl['val_loss']:.6f}.  "
+                              f"It is NOT the same candidate, because the "
+                              f"validation loss is not comparable between "
+                              f"different result weights -- see the comment "
+                              f"above.)")
+        else:
+            good = [s for s in summary if s["val_loss"] is not None]
+            if good:
+                best = min(good, key=lambda s: s["val_loss"])
+                import shutil
+                shutil.copyfile(best["net"], args.best_out)
+                print(f"\n==> best by validation loss: {best['name']} -> "
+                      f"{args.best_out}")
+                print(f"    (this is the old rule.  It tends to pick the "
+                      f"candidate with the smallest result weight, which is "
+                      f"the one that imitates the teacher most closely, and "
+                      f"the teacher is a ceiling.  Prefer --select-by corr.)")
     return 0
 
 
