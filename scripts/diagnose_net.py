@@ -21,6 +21,11 @@ search".  Two things matter for the engine:
 
 Both nets are compared on exactly the same positions, and the handcrafted
 evaluation is included as the reference scale.
+
+Run it on the data the network was actually trained on.  The "did the network
+learn anything its teacher did not know?" section compares the network with
+the teacher value stored in the shard, so it only means something when the
+shard was produced by that network's own teacher.
 """
 import argparse
 import os
@@ -170,6 +175,30 @@ def main():
             acc, cnt = sign_accuracy(hc, pmask)
             row.append(f"HC {acc*100:5.1f}% (n={cnt})")
         print("  ".join(row))
+    print()
+
+    # The question that predicts playing strength: did the network learn
+    # anything the teacher did not know?
+    #
+    # A network distilled from the teacher is a copy of it, and a copy is
+    # never better than the original.  So compare the network's correlation
+    # with the game outcome against the *stored teacher value on the very
+    # same positions*: if the two numbers are the same, the network is a
+    # mimic and it will not be stronger than its teacher.  If the network is
+    # well above the teacher, it has learned the game's result on its own and
+    # that is where its strength comes from.
+    print("  did the network learn anything its teacher did not know?")
+    c_teacher = float(np.corrcoef(mcts_value, result)[0, 1])
+    print(f"    stored teacher value    corr(outcome) {c_teacher:+.4f}")
+    for label, values in vals.items():
+        c_net = float(np.corrcoef(values, result)[0, 1])
+        delta = c_net - c_teacher
+        verdict = ("a MIMIC -- it will not be stronger than its teacher"
+                   if delta < 0.01 else
+                   "it learned beyond its teacher -- this is where the strength "
+                   "comes from")
+        print(f"    {label.strip():<28} corr(outcome) {c_net:+.4f}   "
+              f"({delta:+.4f} vs the teacher)  {verdict}")
     print()
 
     # How much of the decision-relevant band is noise?  Count positions where

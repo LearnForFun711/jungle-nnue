@@ -371,6 +371,12 @@ game to game:
 | 1 | 400 | 202 W, 13 L, 185 D | 0.736 (95% CI [0.693, 0.779]) | **+178** |
 | 3 | 200 | **170 W, 0 L, 30 D** | 0.925 (95% CI [0.889, 0.962]) | **+436** |
 
+A later network, trained on data from the GPU teacher, scored **200 W, 200 L,
+0 D** over 400 games at one second a move: score 0.500, 95% CI [0.451, 0.549],
+Elo **+0.0**.  It ties the handcrafted engine.  The reason is in
+[the rule that shipped the wrong network](#the-rule-that-shipped-the-wrong-network)
+below.
+
 At one second per move the neural engine wins 93.9% of the decisive games
 (95% CI [0.908, 0.971]).  At three seconds it wins *every* decisive game —
 170 out of 170, with no losses at all — and the gap widens rather than
@@ -423,6 +429,20 @@ That is the whole argument for putting some weight on the game's result in
 the training target: the teacher's values are a *ceiling*, and a network that
 only imitates the teacher cannot get past it.  The teacher is the ceiling on
 the quality of the data, not on the quality of the network.
+
+The network trained later on the GPU teacher's data is this story again, and
+more extremely: its correlation with the outcome was +0.341 against its
+teacher's +0.342 — a mimic to within a thousandth — and it tied the
+handcrafted engine.  `scripts/diagnose_net.py` prints that comparison for any
+network, and it is the check to run before believing that a new network is
+an improvement:
+
+```
+  did the network learn anything its teacher did not know?
+    stored teacher value    corr(outcome) +0.2349
+    NEW  net/net-new.nnue        corr(outcome) +0.2425   (+0.0076 vs the teacher)  a MIMIC
+    OLD  net/net.nnue            corr(outcome) +0.3840   (+0.1491 vs the teacher)  it learned beyond its teacher
+```
 
 ### Picking the candidate to take forward
 

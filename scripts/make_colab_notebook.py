@@ -562,7 +562,11 @@ strength, and it is what `--select-by corr` uses.
 import os, sys, time
 
 BUDGET_MINUTES = int(os.environ.get("BUDGET_MINUTES", "480"))   # eight hours
-CONFIGS        = os.environ.get("CONFIGS", "96:48:0.25,96:48:0.50,96:48:0.75,128:64:0.50,256:128:0.50")
+# The result weight is the third number.  The low end is deliberately not
+# below 0.50: a network trained mostly on the teacher's values converges to
+# the teacher, and a copy of the teacher is not stronger than the teacher.
+# The match in cell 8 is still the final arbiter.
+CONFIGS        = os.environ.get("CONFIGS", "96:48:0.50,96:48:0.75,96:48:0.90,128:64:0.75,256:128:0.75")
 BATCH          = int(os.environ.get("BATCH", "8192"))
 LR             = float(os.environ.get("LR", "2e-3"))
 
