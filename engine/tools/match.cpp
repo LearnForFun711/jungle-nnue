@@ -19,6 +19,7 @@
 #include "../src/engine_api.hpp"
 #include "../src/eval.hpp"
 #include "../src/jungle.hpp"
+#include "../src/match_game.hpp"
 #include "../src/nnue.hpp"
 #include "../src/search.hpp"
 
@@ -39,53 +40,6 @@ struct Options {
     // Engine B
     EngineConfig b;
 };
-
-enum End { END_DEN, END_NO_MOVES, END_REPETITION, END_LENGTH };
-
-struct GameResult {
-    int  result;   // +1 A wins (as Red), 0 draw, -1 B wins
-    int  plies;
-    int  cause;
-    int  red_won;  // 1 if the engine playing Red won
-};
-
-struct Stats { long long nodes = 0; long long depth = 0; long long moves = 0; };
-
-GameResult play_game(const Options& o, Engine& red_engine, Engine& black_engine,
-                     Stats* red_stats = nullptr, Stats* black_stats = nullptr) {
-    Position pos;
-    std::vector<uint64_t> history;
-    history.push_back(pos.key);
-
-    while (true) {
-        Engine& engine = (pos.stm == RED) ? red_engine : black_engine;
-        Stats* stats = (pos.stm == RED) ? red_stats : black_stats;
-        Move m = engine.best_move(pos, history);
-        if (m.from == 0xFFFF) break;
-        if (stats) {
-            stats->nodes += (long long)engine.last_nodes();
-            stats->depth += engine.last_depth();
-            ++stats->moves;
-        }
-
-        const bool den_entry = (terrain().den_owner[m.to] == opposite_color(pos.stm));
-        make_move(pos, m);
-        history.push_back(pos.key);
-
-        if (den_entry)
-            return {pos.stm == RED ? +1 : -1, pos.ply, END_DEN, pos.stm == RED ? 1 : 0};
-
-        int reps = 0;
-        for (uint64_t k : history) if (k == pos.key) ++reps;
-        if (reps >= 3) return {0, pos.ply, END_REPETITION, 0};
-        if (int(pos.ply) >= o.max_ply) return {0, pos.ply, END_LENGTH, 0};
-
-        Move buf[128];
-        if (generate_moves(pos, buf) == 0)
-            return {pos.stm == RED ? -1 : +1, pos.ply, END_NO_MOVES, pos.stm == RED ? 0 : 1};
-    }
-    return {0, pos.ply, END_LENGTH, 0};
-}
 
 double elo_from_score(double s) {
     if (s <= 0.0) return -800.0;
@@ -209,9 +163,12 @@ int main(int argc, char** argv) {
             Engine& red_engine   = a_is_red ? ea : eb;
             Engine& black_engine = a_is_red ? eb : ea;
 
-            GameResult gr = play_game(o, red_engine, black_engine,
+            Position pos;
+            std::vector<uint64_t> history;
+            GameResult gr = play_game(red_engine, black_engine, history, pos,
                                        a_is_red ? &a_stats : &b_stats,
-                                       a_is_red ? &b_stats : &a_stats);
+                                       a_is_red ? &b_stats : &a_stats,
+                                       o.max_ply);
             int outcome;   // from A's point of view
             if (gr.result == 0) outcome = 0;
             else {

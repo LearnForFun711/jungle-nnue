@@ -23,6 +23,11 @@ jobs:
       - name: Rule golden test
         run: python3 scripts/verify_golden.py
 
+      - name: The match harness reports the winner, not the loser
+        run: |
+          set -e
+          ./engine/build/game_check --games 8 --time 0.05
+
       - name: Colab notebook parses
         run: python3 scripts/verify_notebook.py
 
@@ -54,6 +59,12 @@ jobs:
           ./engine/build/match --games 4 --threads 2 --time 0.02 \
                                 --engine-a "ab:nnue=/tmp/ci-run/net.nnue" \
                                 --engine-b ab
+
+      - name: The match harness reports the winner with a network too
+        run: |
+          set -e
+          . .venv/bin/activate
+          ./engine/build/game_check --games 8 --time 0.05 --nnue /tmp/ci-run/net.nnue
 
       - name: The GPU teacher agrees with the engine's teacher
         run: |

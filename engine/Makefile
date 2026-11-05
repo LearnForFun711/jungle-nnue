@@ -18,7 +18,7 @@ ifeq ($(NATIVE),1)
   CXXFLAGS += -march=native
 endif
 
-TOOLS := selfplay match dump_moves bench eval_nnue nnue_check teacher_probe nnue_ref
+TOOLS := selfplay match dump_moves bench eval_nnue nnue_check teacher_probe nnue_ref game_check
 LIB   := libjungle
 
 # The GPU teacher.  These are the same code the CUDA extension compiles, but
