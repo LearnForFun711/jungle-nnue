@@ -641,22 +641,37 @@ import glob, json, os, shutil, subprocess
 
 MATCH_GAMES = int(os.environ.get("MATCH_GAMES", "60"))
 MATCH_TIME = float(os.environ.get("MATCH_TIME", "0.25"))
+FINAL_GAMES = int(os.environ.get("FINAL_GAMES", "300"))
+FINAL_TIME = float(os.environ.get("FINAL_TIME", "0.5"))
+KEEP = int(os.environ.get("KEEP", "3"))
 THREADS = str(os.cpu_count() or 2)
 
+
+def play(net, games, seconds):
+    # One match, and its score.
+    proc = subprocess.run(
+        ["./engine/build/match", "--games", str(games),
+         "--threads", THREADS, "--time", str(seconds),
+         "--engine-a", f"ab:nnue={net}", "--engine-b", "ab"],
+        capture_output=True, text=True)
+    try:
+        return json.loads(proc.stdout)
+    except Exception:
+        print(proc.stdout[-500:], proc.stderr[-500:])
+        return None
+
+
+# First round: every candidate, a short match.  This is only a filter --
+# sixty games cannot tell two close candidates apart, and picking the winner
+# of it means picking a coin toss.  A network that lost the coin toss here
+# can still be the strongest one.
 results = []
 for net in sorted(glob.glob("/content/candidates/*.nnue")):
     name = os.path.basename(net)
     print(f"\\n=== {name} vs the handcrafted engine "
           f"({MATCH_GAMES} games at {MATCH_TIME}s/move) ===", flush=True)
-    proc = subprocess.run(
-        ["./engine/build/match", "--games", str(MATCH_GAMES),
-         "--threads", THREADS, "--time", str(MATCH_TIME),
-         "--engine-a", f"ab:nnue={net}", "--engine-b", "ab"],
-        capture_output=True, text=True)
-    try:
-        d = json.loads(proc.stdout)
-    except Exception:
-        print(proc.stdout[-500:], proc.stderr[-500:])
+    d = play(net, MATCH_GAMES, MATCH_TIME)
+    if d is None:
         continue
     score = d["score_a"]
     print(f"    {d['a_wins']} W / {d['b_wins']} L / {d['draws']} D   "
@@ -666,6 +681,29 @@ for net in sorted(glob.glob("/content/candidates/*.nnue")):
 
 if results:
     results.sort(reverse=True)
+    print("\\n=== the candidates, strongest first (the short match) ===")
+    for score, name, net in results:
+        print(f"    {score:.3f}  {name}")
+
+    # Second round: the best few, a much longer match.  This is the one that
+    # decides.
+    finalists = results[:max(1, KEEP)]
+    if len(finalists) > 1:
+        print(f"\\n=== the final, over {FINAL_GAMES} games at {FINAL_TIME}s/move ===")
+        finals = []
+        for score, name, net in finalists:
+            d = play(net, FINAL_GAMES, FINAL_TIME)
+            if d is None:
+                finals.append((score, name, net))
+                continue
+            print(f"    {name:28s} {d['a_wins']:3d} W / {d['b_wins']:3d} L / "
+                  f"{d['draws']:3d} D   score {d['score_a']:.3f}   "
+                  f"Elo {d['elo_a']:+.1f}   "
+                  f"95% CI {d['score_ci95'][0]:.3f}..{d['score_ci95'][1]:.3f}")
+            finals.append((d["score_a"], name, net))
+        finals.sort(reverse=True)
+        results = finals
+
     print("\\n=== the candidates, strongest first ===")
     for score, name, net in results:
         print(f"    {score:.3f}  {name}")
@@ -739,6 +777,10 @@ files.download("/content/net.nnue")
 # The learning curve ...
 if os.path.exists("/content/learning-curve.png"):
     files.download("/content/learning-curve.png")
+
+# How each candidate scored, so the choice can be looked at afterwards.
+if os.path.exists("/content/strength.json"):
+    files.download("/content/strength.json")
 
 # ... every candidate, in one archive, so the strongest one can be chosen by
 # playing strength rather than by validation loss.

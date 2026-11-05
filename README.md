@@ -397,6 +397,50 @@ engine's evaluation cost is what decides how many nodes it can search.
 
 ---
 
+### How good is a network, really?
+
+The number that matters is the correlation between the network's value and the
+result of the game the position came from — that is what a value function is
+*for*.  `scripts/eval_net_quality.py` measures it on a shard and puts the
+handcrafted evaluation on the same positions, so the two are always compared
+on the same data.
+
+Two networks, both trained on the same self-play data, measured on the same
+30,000 positions:
+
+| network | correlation with the game outcome | correlation with the teacher's values |
+|---|---|---|
+| the handcrafted evaluation (the thing to beat) | +0.162 | — |
+| network A | **+0.356** | +0.898 |
+| network B | +0.205 | +0.941 |
+
+The second column is the more interesting one.  Network B reproduces the
+teacher's values almost exactly — it is a faithful student — and it is the
+weaker player.  Network A moves away from the teacher, in the direction of
+the game's result, and it is the stronger player.
+
+That is the whole argument for putting some weight on the game's result in
+the training target: the teacher's values are a *ceiling*, and a network that
+only imitates the teacher cannot get past it.  The teacher is the ceiling on
+the quality of the data, not on the quality of the network.
+
+### Picking the candidate to take forward
+
+The candidates play, because a lower validation loss does not mean a stronger
+engine: a wider network evaluates more accurately but more slowly, and at a
+fixed clock the slower engine searches less deeply.
+
+Sixty games at a quarter of a second a move is enough to sort the candidates
+roughly, and **not** enough to pick between two of them — the 95% confidence
+interval on a sixty-game score is about ±0.12, wider than the difference
+between two good candidates.  Picking the winner of that is picking a coin
+toss, and it is how a weaker network ends up being the one that is shipped.
+
+So the notebook does it in two rounds: a short match for every candidate, and
+then a long one — three hundred games at half a second — for the best few.
+
+---
+
 ## Training on Colab
 
 `colab/train_colab.ipynb` is the whole training story in one notebook: fetch
