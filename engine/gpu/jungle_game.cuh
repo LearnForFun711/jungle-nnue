@@ -27,15 +27,25 @@ struct Game {
     const Geometry* geom = nullptr;
     const MctsConfig* cfg = nullptr;
 
+    // Which network plays which side.  In a league the two sides play with
+    // different networks, and each side evaluates the positions it is about
+    // to move in with its own network -- the same way the engine's own
+    // evaluation works, where the value is always from the point of view of
+    // the side to move.
+    uint8_t red_net = 0;
+    uint8_t black_net = 0;
+
     int phase = GAME_SEARCH;
     int result = 0;       // the result from Red's point of view
     int end_cause = END_LENGTH;
 
     JGPU_DEVICE void start(GameMem* memory, const Geometry* geometry, const MctsConfig* config,
-               uint64_t seed) {
+               uint64_t seed, uint8_t red = 0, uint8_t black = 0) {
         mem = memory;
         geom = geometry;
         cfg = config;
+        red_net = red;
+        black_net = black;
         t.geom = geometry;
         t.cfg = config;
         t.mem = memory;
@@ -49,6 +59,29 @@ struct Game {
         end_cause = END_LENGTH;
         record_position();
         t.begin_search();
+    }
+
+    // The network that evaluates a child of the current node: the one that
+    // plays the side to move in the child, which is the opponent of the side
+    // to move in the parent.
+    JGPU_DEVICE uint8_t leaf_net() const {
+        return (t.board.stm == RED) ? black_net : red_net;
+    }
+
+    // Fill in one leaf evaluation request.  The CUDA kernel and the CPU
+    // reference both go through here, so they cannot drift apart.
+    JGPU_DEVICE void fill_request(Request& r, uint32_t game_index,
+                                  uint16_t child_index) const {
+        const Board& parent = t.board;
+        r.game = game_index;
+        r.child = child_index;
+        r.stm = uint16_t(parent.stm ^ 1);
+        r.net_id = leaf_net();
+        const int from = t.child_from[child_index];
+        const int to = t.child_to[child_index];
+        memcpy(r.board, parent.sq, 63);
+        r.board[from] = 0;
+        r.board[to] = parent.sq[from];
     }
 
     JGPU_DEVICE void record_position() {

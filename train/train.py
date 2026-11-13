@@ -59,6 +59,20 @@ def to_gpu(arrays, device):
     return out
 
 
+def value_loss(v, y, weight, huber=0.0):
+    """The loss, with an optional weight per position and an optional Huber
+    tail.  The Huber version stops one strange position from dominating a
+    batch, which matters when the target is the outcome of a game: the last
+    few positions of a game that was decided by one lucky capture are very
+    different from the rest of it."""
+    if huber > 0.0:
+        d = v - y
+        a = d.abs()
+        per = torch.where(a <= huber, 0.5 * d * d, huber * (a - 0.5 * huber))
+        return (per * weight).sum() / weight.sum().clamp_min(1.0)
+    return torch.nn.functional.mse_loss(v, y, weight=weight)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/data.t*.bin")
@@ -72,6 +86,18 @@ def main():
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--result-weight", type=float, default=0.25,
                     help="weight of the game-result term in the target blend")
+    ap.add_argument("--target", default="blend", choices=("blend", "outcome"),
+                    help="what the network is asked to predict: 'blend' is the "
+                         "teacher's value mixed with the game's result, "
+                         "'outcome' is the game's result alone, which is the "
+                         "reinforcement-learning objective and the only target "
+                         "that is not capped by the teacher")
+    ap.add_argument("--sample-weight", default="none",
+                    choices=("none", "decisive", "late", "both"),
+                    help="how much each position counts in the loss")
+    ap.add_argument("--huber", type=float, default=0.0,
+                    help="if above zero, the loss is a Huber loss with this "
+                         "delta instead of the mean squared error")
     ap.add_argument("--val-fraction", type=float, default=0.02)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--threads", type=int, default=8)
@@ -125,6 +151,8 @@ def main():
     ps = stm_t[idx].to(device)
     py = ((1.0 - args.result_weight) * value_t[idx].to(device)
           + args.result_weight * result_t[idx].to(device)).float()
+    if args.target == "outcome":
+        py = result_t[idx].to(device).float()
     pfr, pfb = make_features(pb, ps)
     ploss = torch.nn.functional.mse_loss(probe(pfr, pfb, ps).float(), py)
     ploss.backward()
@@ -141,23 +169,66 @@ def main():
     # The dataset stores both the MCTS value and the game result from the
     # point of view of the side to move, which is exactly what the network
     # outputs, so no sign flipping is needed here.
+    #
+    # --target chooses what the network is asked to predict:
+    #
+    #   blend   (1-w) * teacher_value + w * game_result.  The teacher's value
+    #           is a dense, low-variance target and the game's result is the
+    #           ground truth but a noisy one.
+    #   outcome the game's result alone.  This is the reinforcement-learning
+    #           objective: the reward is the outcome of the game the position
+    #           came from, and the network learns the expected outcome of a
+    #           position.  It is the only target that is not capped by the
+    #           teacher, so it is the only one that can make the network
+    #           *better* than the teacher it was distilled from.
     w = args.result_weight
-    target_all = (1.0 - w) * value_t + w * result_t
+    if args.target == "outcome":
+        target_all = result_t.clone()
+    else:
+        target_all = (1.0 - w) * value_t + w * result_t
+
+    # How much each position counts.  Two positions from the same game carry
+    # the same result but not the same information: a position in a drawn game
+    # says much less than a position in a game that was won, and a position
+    # close to the end of the game is much closer to the outcome than one in
+    # the opening.  The weights make the network spend its capacity where the
+    # outcome is actually decided.
+    weight_all = torch.ones_like(target_all)
+    if args.sample_weight == "decisive":
+        # Positions from drawn games count for a quarter of the others.
+        decisive = (result_t.abs() > 0.5).float()
+        weight_all = 0.25 + 0.75 * decisive
+    elif args.sample_weight == "late":
+        # Linearly from 0.3 in the opening to 1.0 at the end of the game.
+        ply_t = torch.from_numpy(ply.astype("float32")) if ply is not None else None
+        if ply_t is not None:
+            weight_all = (0.3 + 0.7 * (ply_t / 60.0).clamp(0.0, 1.0))
+    elif args.sample_weight == "both":
+        decisive = (result_t.abs() > 0.5).float()
+        ply_t = torch.from_numpy(ply.astype("float32")) if ply is not None else None
+        late = (0.3 + 0.7 * (ply_t / 60.0).clamp(0.0, 1.0)) if ply_t is not None else 1.0
+        weight_all = (0.25 + 0.75 * decisive) * late
+    if args.sample_weight != "none":
+        print(f"  sample weights ({args.sample_weight}): "
+              f"mean {float(weight_all.mean()):.3f}", flush=True)
 
     # Keep everything on the GPU when it fits -- the feature construction is
     # then essentially free.  The board is kept as uint8 (63 bytes per
     # position), so the whole 3.7M-position dataset is under 300 MB.
     gpu_bytes = (board_t.numel() * board_t.element_size()
                  + stm_t.numel() * stm_t.element_size()
-                 + target_all.numel() * target_all.element_size())
+                 + target_all.numel() * target_all.element_size()
+                 + weight_all.numel() * weight_all.element_size())
     if device.type == "cuda" and gpu_bytes < 8e9:
         board_all = board_t.to(device)
         stm_all = stm_t.to(device)
         target_all = target_all.to(device)
+        weight_all = weight_all.to(device)
         resident = True
     else:
         board_all, stm_all = board_t, stm_t
         target_all = target_all.to(device)
+        weight_all = weight_all.to(device)
         resident = False
     target_all = target_all.contiguous()
     print(f"  resident on GPU: {resident}", flush=True)
@@ -255,6 +326,13 @@ def main():
     max_epochs = args.epochs if budget <= 0 else 10 ** 9
     while epoch < max_epochs:
         epoch += 1
+        # The budget is checked here as well as inside the batch loop: a
+        # dataset smaller than one batch produces no steps at all, and the
+        # check inside the loop would never be reached.
+        if budget and (time.time() - start) / 60 > budget:
+            print("  time budget reached, stopping", flush=True)
+            stop = True
+            break
         model.train()
         running, seen = 0.0, 0
         # Refresh the per-layer scaling: the weight magnitudes drift during
@@ -264,18 +342,23 @@ def main():
             w_group["base_lr"] = layer_lr(layer, name)
         perm = tr_idx.copy()
         np.random.default_rng(args.seed + epoch).shuffle(perm)
-        for i in range(0, len(perm) - args.batch + 1, args.batch):
+        # A dataset smaller than one batch still gets one batch: the step
+        # would otherwise be zero, and a run that does nothing looks like a
+        # run that is not learning.
+        for i in range(0, max(len(perm) - args.batch + 1, 1), args.batch):
             idx = perm[i:i + args.batch]
             if resident:
                 ti = torch.from_numpy(idx).to(device, non_blocking=True)
                 b = board_all[ti].long()
                 s = stm_all[ti]
                 y = target_all[ti]
+                wgt = weight_all[ti]
             else:
                 ti = torch.from_numpy(idx)
                 b = board_t[ti].to(device, non_blocking=True).long()
                 s = stm_t[ti].to(device, non_blocking=True)
                 y = target_all[ti.to(device)]
+                wgt = weight_all[ti.to(device)]
 
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * lr_at(step) / args.lr
@@ -283,7 +366,7 @@ def main():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                 fr, fb = make_features(b, s)
                 v = model(fr, fb, s)
-                loss = torch.nn.functional.mse_loss(v.float(), y.float())
+                loss = value_loss(v.float(), y.float(), wgt.float(), args.huber)
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -329,14 +412,16 @@ def main():
                 if resident:
                     td = ti.to(device)
                     b, s, y = board_all[td].long(), stm_all[td], target_all[td]
+                    wgt = weight_all[td]
                 else:
                     b = board_t[ti].to(device).long()
                     s = stm_t[ti].to(device)
                     y = target_all[ti.to(device)]
+                    wgt = weight_all[ti.to(device)]
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                     fr, fb = make_features(b, s)
                     v = model(fr, fb, s)
-                vs += torch.nn.functional.mse_loss(v.float(), y.float()).item() * len(idx)
+                vs += value_loss(v.float(), y.float(), wgt.float(), args.huber).item() * len(idx)
                 vn += len(idx)
 
                 # float32 throughout: the MPS backend has no float64, and

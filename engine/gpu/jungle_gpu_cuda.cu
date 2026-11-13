@@ -42,15 +42,6 @@ using namespace jungle_gpu;
         }                                                                       \
     } while (0)
 
-// One request: whose child it is, which child, whose turn it is, and the
-// board itself.
-struct Request {
-    uint32_t game;
-    uint16_t child;
-    uint16_t stm;
-    uint8_t  board[63];
-};
-
 // The requests a warp can hold in one round.  A warp has thirty-two lanes
 // and a position has at most ninety-six legal moves, so 32 * 128 is enough.
 constexpr int WARP_QUEUE = 32 * 128;
@@ -226,10 +217,14 @@ __device__ __forceinline__ float nnue_eval_batch(const Net& net, const uint8_t* 
 // The kernel
 // ---------------------------------------------------------------------------
 
-__global__ void selfplay_kernel(GameMem* mems, const Net* net, const Geometry* geom,
-                                 const MctsConfig* cfg, int num_games, uint64_t seed,
-                                 Request* queue, float* values,
-                                 uint8_t* out_records, int* out_counts) {
+__global__ void selfplay_kernel(GameMem* mems, const Net* const* nets,
+                                const Geometry* geom,
+                                const MctsConfig* cfg, int num_games, uint64_t seed,
+                                Request* queue, float* values,
+                                uint8_t* out_records, int* out_counts,
+                                int* out_results,
+                                const uint8_t* game_red_net,
+                                const uint8_t* game_black_net) {
     const int gid = blockIdx.x * blockDim.x + threadIdx.x;
     const int lane = threadIdx.x & 31;
     // Two different warps: the one inside the block picks the slice of the
@@ -240,10 +235,12 @@ __global__ void selfplay_kernel(GameMem* mems, const Net* net, const Geometry* g
     const int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
 
     // The shared memory the network's forward pass needs, one slice per warp:
-    // the feature transformer output and the two hidden layers.
+    // the feature transformer output and the two hidden layers.  Every
+    // network in a league has the same shape -- the host refuses to start
+    // otherwise -- so one slice serves all of them.
     extern __shared__ char smem[];
-    const int FH = net->ft_hidden;
-    const int H = net->hidden;
+    const int FH = nets[0]->ft_hidden;
+    const int H = nets[0]->hidden;
     float* slice = reinterpret_cast<float*>(smem) + size_t(warp_in_block) * (2 * FH + 4 * H);
     float* shared_ft = slice;
     float* shared_h0 = slice + 2 * FH;
@@ -254,7 +251,8 @@ __global__ void selfplay_kernel(GameMem* mems, const Net* net, const Geometry* g
     bool have_game = game_index < num_games;
     if (have_game)
         game.start(&mems[game_index], geom, cfg,
-                   seed * 0x9E3779B97F4A7C15ULL + uint64_t(game_index) + 1);
+                   seed * 0x9E3779B97F4A7C15ULL + uint64_t(game_index) + 1,
+                   game_red_net[game_index], game_black_net[game_index]);
 
     Request* my_queue = queue + size_t(warp_global) * WARP_QUEUE;
 
@@ -283,15 +281,8 @@ __global__ void selfplay_kernel(GameMem* mems, const Net* net, const Geometry* g
         if (need) {
             const Board& parent = game.t.board;
             for (int i = 0; i < my_count; ++i) {
-                Request& r = my_queue[base + i];
-                r.game = uint32_t(game_index);
-                r.child = uint16_t(i);
-                r.stm = uint16_t(parent.stm ^ 1);
-                const int from = game.t.child_from[i];
-                const int to = game.t.child_to[i];
-                memcpy(r.board, parent.sq, 63);
-                r.board[from] = 0;
-                r.board[to] = parent.sq[from];
+                game.fill_request(my_queue[base + i], uint32_t(game_index),
+                                  uint16_t(i));
             }
         }
         __syncwarp();
@@ -299,7 +290,8 @@ __global__ void selfplay_kernel(GameMem* mems, const Net* net, const Geometry* g
         // ---- the network, one position at a time, the whole warp on each
         for (int p = 0; p < total; ++p) {
             const Request& r = my_queue[p];
-            const float value = nnue_eval_batch(*net, r.board, int(r.stm),
+            // The network that plays the side to move in this position.
+            const float value = nnue_eval_batch(*nets[r.net_id], r.board, int(r.stm),
                                                 shared_ft, shared_h0, shared_h1);
             if (lane == 0) values[size_t(r.game) * MAX_CHILDREN + r.child] = value;
             __syncwarp();
@@ -318,14 +310,22 @@ __global__ void selfplay_kernel(GameMem* mems, const Net* net, const Geometry* g
             game.finish_records();
             GameMem* m = &mems[game_index];
             const int n = m->record_count;
-            memcpy(out_records + size_t(game_index) * MAX_RECORDS * RECORD_SIZE,
-                   m->records[0], size_t(n) * RECORD_SIZE);
+            // The records are only wanted when the games are training data.
+            // A league round does not need them, and they are the bulk of
+            // the memory.
+            if (out_records)
+                memcpy(out_records + size_t(game_index) * MAX_RECORDS * RECORD_SIZE,
+                       m->records[0], size_t(n) * RECORD_SIZE);
             out_counts[game_index] = n;
+            // The result, from Red's point of view: +1 Red won, 0 draw,
+            // -1 Black won.
+            out_results[game_index] = game.result;
             game_index += 32;
             have_game = game_index < num_games;
             if (have_game)
                 game.start(&mems[game_index], geom, cfg,
-                           seed * 0x9E3779B97F4A7C15ULL + uint64_t(game_index) + 1);
+                           seed * 0x9E3779B97F4A7C15ULL + uint64_t(game_index) + 1,
+                           game_red_net[game_index], game_black_net[game_index]);
         }
         __syncwarp();
     }
@@ -403,18 +403,40 @@ py::dict memory_model(int threads) {
     return d;
 }
 
-py::dict run_gpu(const std::string& net_path, const std::string& out_path, int games,
-                  int sims, uint64_t seed, double leaf_scale, double value_scale,
-                  double c_puct, double widening, double dirichlet_alpha,
-                  double dirichlet_eps, int max_ply, int threads) {
+// The plan for a batch of games: which network plays which side in each of
+// them.  With one network every game is that network against itself, which
+// is the self-play generator.  With several it is a league round.
+struct GamePlan {
+    std::vector<std::string> net_paths;
+    std::vector<uint8_t> red_net;    // per game
+    std::vector<uint8_t> black_net;  // per game
+};
+
+py::dict run_games(const GamePlan& plan, const std::string& out_path, int games,
+                   int sims, uint64_t seed, double leaf_scale, double value_scale,
+                   double c_puct, double widening, double dirichlet_alpha,
+                   double dirichlet_eps, int max_ply, int threads, bool want_records) {
     py::dict stats;
-    Net net;
-    if (!load_net(net_path.c_str(), net)) {
-        throw std::runtime_error("cannot load " + net_path);
+    if (plan.net_paths.empty()) throw std::runtime_error("no networks");
+    if (int(plan.red_net.size()) < games || int(plan.black_net.size()) < games)
+        throw std::runtime_error("the schedule is shorter than the number of games");
+
+    // The networks, and the check that they can share one forward pass: the
+    // shared memory slice is sized for one shape, so every network in a
+    // league has to have the same one.
+    std::vector<Net> nets(plan.net_paths.size());
+    for (size_t i = 0; i < plan.net_paths.size(); ++i) {
+        if (!load_net(plan.net_paths[i].c_str(), nets[i]))
+            throw std::runtime_error("cannot load " + plan.net_paths[i]);
+        if ((nets[i].hidden + 31) / 32 > 8)
+            throw std::runtime_error("hidden layer too wide for the warp kernel");
+        if (nets[i].ft_hidden != nets[0].ft_hidden || nets[i].hidden != nets[0].hidden)
+            throw std::runtime_error(
+                "every network in a league must have the same shape: " +
+                plan.net_paths[i] + " differs from " + plan.net_paths[0]);
     }
-    if ((net.hidden + 31) / 32 > 8) {
-        throw std::runtime_error("hidden layer too wide for the warp kernel");
-    }
+    const Net& shape = nets[0];
+
     Geometry geom = build_geometry();
     MctsConfig cfg;
     cfg.sims = sims;
@@ -426,7 +448,7 @@ py::dict run_gpu(const std::string& net_path, const std::string& out_path, int g
     cfg.dirichlet_eps = dirichlet_eps;
     cfg.max_ply = max_ply;
 
-    if (threads <= 0) threads = choose_threads(net);
+    if (threads <= 0) threads = choose_threads(shape);
     if (threads % 32 != 0) threads = (threads / 32) * 32;
     if (threads < 32) threads = 32;
 
@@ -434,43 +456,63 @@ py::dict run_gpu(const std::string& net_path, const std::string& out_path, int g
     const int warps = blocks * (threads / 32);
 
     GameMem* d_mems = nullptr;
-    Net* d_net = nullptr;
+    Net** d_net_ptrs = nullptr;
     Geometry* d_geom = nullptr;
     MctsConfig* d_cfg = nullptr;
     Request* d_queue = nullptr;
     float* d_values = nullptr;
     uint8_t* d_records = nullptr;
     int* d_counts = nullptr;
+    int* d_results = nullptr;
+    uint8_t* d_red = nullptr;
+    uint8_t* d_black = nullptr;
 
     CUDA_CHECK(cudaMalloc(&d_mems, size_t(games) * sizeof(GameMem)));
-    CUDA_CHECK(cudaMalloc(&d_net, sizeof(Net)));
+    CUDA_CHECK(cudaMalloc(&d_net_ptrs, nets.size() * sizeof(Net*)));
     CUDA_CHECK(cudaMalloc(&d_geom, sizeof(Geometry)));
     CUDA_CHECK(cudaMalloc(&d_cfg, sizeof(MctsConfig)));
     CUDA_CHECK(cudaMalloc(&d_queue, size_t(warps) * WARP_QUEUE * sizeof(Request)));
     CUDA_CHECK(cudaMalloc(&d_values, size_t(games) * MAX_CHILDREN * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_records, size_t(games) * MAX_RECORDS * RECORD_SIZE));
     CUDA_CHECK(cudaMalloc(&d_counts, size_t(games) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_results, size_t(games) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_red, size_t(games) * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&d_black, size_t(games) * sizeof(uint8_t)));
+    if (want_records)
+        CUDA_CHECK(cudaMalloc(&d_records, size_t(games) * MAX_RECORDS * RECORD_SIZE));
 
-    CUDA_CHECK(cudaMemcpy(d_net, &net, sizeof(Net), cudaMemcpyHostToDevice));
+    // One allocation per network, and an array of pointers to them.
+    std::vector<Net*> net_ptrs(nets.size(), nullptr);
+    for (size_t i = 0; i < nets.size(); ++i) {
+        CUDA_CHECK(cudaMalloc(&net_ptrs[i], sizeof(Net)));
+        CUDA_CHECK(cudaMemcpy(net_ptrs[i], &nets[i], sizeof(Net), cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaMemcpy(d_net_ptrs, net_ptrs.data(), nets.size() * sizeof(Net*),
+                          cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_geom, &geom, sizeof(Geometry), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_cfg, &cfg, sizeof(MctsConfig), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemset(d_mems, 0, size_t(games) * sizeof(GameMem)));
     CUDA_CHECK(cudaMemset(d_values, 0, size_t(games) * MAX_CHILDREN * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_counts, 0, size_t(games) * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_results, 0, size_t(games) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_red, plan.red_net.data(), size_t(games) * sizeof(uint8_t),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_black, plan.black_net.data(), size_t(games) * sizeof(uint8_t),
+                          cudaMemcpyHostToDevice));
 
     // The Zobrist table has to reach the device as well.
     CUDA_CHECK(cudaMemcpyToSymbol(jungle_gpu::g_zobrist, &host_zobrist(),
                                   sizeof(ZobristTable)));
 
-    const size_t smem = size_t(threads / 32) * smem_per_warp(net);
+    const size_t smem = size_t(threads / 32) * smem_per_warp(shape);
 
     cudaEvent_t t0, t1;
     cudaEventCreate(&t0);
     cudaEventCreate(&t1);
     cudaEventRecord(t0);
 
-    selfplay_kernel<<<blocks, threads, smem>>>(d_mems, d_net, d_geom, d_cfg, games, seed,
-                                                d_queue, d_values, d_records, d_counts);
+    selfplay_kernel<<<blocks, threads, smem>>>(d_mems, d_net_ptrs, d_geom, d_cfg, games,
+                                                seed, d_queue, d_values, d_records,
+                                                d_counts, d_results, d_red, d_black);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaEventRecord(t1);
@@ -480,46 +522,65 @@ py::dict run_gpu(const std::string& net_path, const std::string& out_path, int g
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
 
-    // The records, back to the host.
-    std::vector<uint8_t> records(size_t(games) * MAX_RECORDS * RECORD_SIZE);
-    std::vector<int> counts(size_t(games), 0);
-    CUDA_CHECK(cudaMemcpy(records.data(), d_records, records.size(), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(counts.data(), d_counts, counts.size(), cudaMemcpyDeviceToHost));
+    // The results, back to the host: +1 Red won, 0 draw, -1 Black won.
+    std::vector<int> results(size_t(games), 0);
+    CUDA_CHECK(cudaMemcpy(results.data(), d_results, results.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost));
 
-    // Write the shard, and count what came out of it.
     long long positions = 0;
     int red_wins = 0, black_wins = 0, draws = 0, played = 0;
-    std::FILE* f = std::fopen(out_path.c_str(), "wb");
-    if (f) {
-        for (int g = 0; g < games; ++g) {
-            const int n = counts[g];
-            if (n <= 0) continue;
-            const uint8_t* rec = records.data() + size_t(g) * MAX_RECORDS * RECORD_SIZE;
-            std::fwrite(rec, RECORD_SIZE, size_t(n), f);
-            positions += n;
-            ++played;
-            const int code = (rec[63] >> 2) & 3;
-            if (code == 2) ++red_wins;
-            else if (code == 0) ++black_wins;
-            else ++draws;
+    for (int g = 0; g < games; ++g) {
+        ++played;
+        if (results[g] > 0) ++red_wins;
+        else if (results[g] < 0) ++black_wins;
+        else ++draws;
+    }
+
+    if (want_records) {
+        std::vector<uint8_t> records(size_t(games) * MAX_RECORDS * RECORD_SIZE);
+        std::vector<int> counts(size_t(games), 0);
+        CUDA_CHECK(cudaMemcpy(records.data(), d_records, records.size(),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(counts.data(), d_counts, counts.size() * sizeof(int),
+                              cudaMemcpyDeviceToHost));
+
+        std::FILE* f = std::fopen(out_path.c_str(), "wb");
+        if (f) {
+            for (int g = 0; g < games; ++g) {
+                const int n = counts[g];
+                if (n <= 0) continue;
+                const uint8_t* rec = records.data() + size_t(g) * MAX_RECORDS * RECORD_SIZE;
+                std::fwrite(rec, RECORD_SIZE, size_t(n), f);
+                positions += n;
+            }
+            std::fclose(f);
         }
-        std::fclose(f);
     }
 
     CUDA_CHECK(cudaFree(d_mems));
-    CUDA_CHECK(cudaFree(d_net));
+    for (size_t i = 0; i < net_ptrs.size(); ++i) CUDA_CHECK(cudaFree(net_ptrs[i]));
+    CUDA_CHECK(cudaFree(d_net_ptrs));
     CUDA_CHECK(cudaFree(d_geom));
     CUDA_CHECK(cudaFree(d_cfg));
     CUDA_CHECK(cudaFree(d_queue));
     CUDA_CHECK(cudaFree(d_values));
-    CUDA_CHECK(cudaFree(d_records));
+    if (d_records) CUDA_CHECK(cudaFree(d_records));
     CUDA_CHECK(cudaFree(d_counts));
+    CUDA_CHECK(cudaFree(d_results));
+    CUDA_CHECK(cudaFree(d_red));
+    CUDA_CHECK(cudaFree(d_black));
+
+    // The result of every game, so that the caller can attribute it to the
+    // pair of networks that played it.
+    py::list per_game;
+    for (int g = 0; g < games; ++g) per_game.append(results[g]);
 
     stats["games"] = played;
     stats["positions"] = positions;
     stats["red_wins"] = red_wins;
     stats["black_wins"] = black_wins;
     stats["draws"] = draws;
+    stats["results"] = per_game;
     stats["seconds"] = seconds / 1000.0;
     stats["positions_per_second"] = seconds > 0 ? positions / (seconds / 1000.0) : 0.0;
     stats["games_per_second"] = seconds > 0 ? played / (seconds / 1000.0) : 0.0;
@@ -529,8 +590,50 @@ py::dict run_gpu(const std::string& net_path, const std::string& out_path, int g
     stats["vram_bytes"] = (long long)(size_t(games) * sizeof(GameMem) +
                                        size_t(warps) * WARP_QUEUE * sizeof(Request) +
                                        size_t(games) * MAX_CHILDREN * sizeof(float) +
-                                       size_t(games) * MAX_RECORDS * RECORD_SIZE);
+                                       (want_records
+                                            ? size_t(games) * MAX_RECORDS * RECORD_SIZE
+                                            : 0));
     return stats;
+}
+
+py::dict run_gpu(const std::string& net_path, const std::string& out_path, int games,
+                  int sims, uint64_t seed, double leaf_scale, double value_scale,
+                  double c_puct, double widening, double dirichlet_alpha,
+                  double dirichlet_eps, int max_ply, int threads) {
+    GamePlan plan;
+    plan.net_paths.push_back(net_path);
+    plan.red_net.assign(size_t(games), 0);
+    plan.black_net.assign(size_t(games), 0);
+    return run_games(plan, out_path, games, sims, seed, leaf_scale, value_scale,
+                     c_puct, widening, dirichlet_alpha, dirichlet_eps, max_ply,
+                     threads, true);
+}
+
+// A league round: every game is a pair of networks, and the caller says which
+// pair plays in which game.
+py::dict league_gpu(const std::vector<std::string>& net_paths,
+                    const std::vector<int>& red_ids, const std::vector<int>& black_ids,
+                    int games, int sims, uint64_t seed, double leaf_scale,
+                    double value_scale, double c_puct, double widening,
+                    double dirichlet_alpha, double dirichlet_eps, int max_ply,
+                    int threads) {
+    if (int(red_ids.size()) < games || int(black_ids.size()) < games)
+        throw std::runtime_error("the schedule is shorter than the number of games");
+    GamePlan plan;
+    plan.net_paths = net_paths;
+    plan.red_net.resize(size_t(games));
+    plan.black_net.resize(size_t(games));
+    for (int g = 0; g < games; ++g) {
+        const int r = red_ids[g], b = black_ids[g];
+        if (r < 0 || b < 0 || r >= int(net_paths.size()) || b >= int(net_paths.size()))
+            throw std::runtime_error("the schedule names a network that does not exist");
+        plan.red_net[size_t(g)] = uint8_t(r);
+        plan.black_net[size_t(g)] = uint8_t(b);
+    }
+    // The league does not need the training records, and they are the bulk of
+    // the memory: a hundred thousand games of records is gigabytes.
+    return run_games(plan, "", games, sims, seed, leaf_scale, value_scale, c_puct,
+                     widening, dirichlet_alpha, dirichlet_eps, max_ply, threads, false);
 }
 
 // The GPU's forward pass on a batch of positions, so that it can be compared
@@ -581,6 +684,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("max_ply") = 200, py::arg("threads") = 0);
     m.def("nnue_batch", &nnue_batch, "evaluate a batch of positions on the GPU",
           py::arg("boards"), py::arg("stms"), py::arg("net_path"));
+    m.def("league", &league_gpu, "play a league round: a schedule of network pairs",
+          py::arg("net_paths"), py::arg("red_ids"), py::arg("black_ids"),
+          py::arg("games") = 1024, py::arg("sims") = 800, py::arg("seed") = 12345,
+          py::arg("leaf_scale") = 0.125, py::arg("value_scale") = 10.0,
+          py::arg("c_puct") = 1.4, py::arg("widening") = 1.6,
+          py::arg("dirichlet_alpha") = 0.30, py::arg("dirichlet_eps") = 0.25,
+          py::arg("max_ply") = 200, py::arg("threads") = 0);
     m.def("memory_model", &memory_model, "how much memory the generator needs",
           py::arg("threads") = 256);
 }

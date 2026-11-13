@@ -210,4 +210,26 @@ JGPU_DEVICE inline int feature_index(int sq, int piece, int own) {
     return s * 16 + bucket;
 }
 
+// ---------------------------------------------------------------------------
+// A leaf evaluation request
+//
+// When the generator plays a game, every position the search expands needs a
+// value, and the value comes from a network.  With a single network there is
+// nothing to say about *which* network; with a league there is, because the
+// two sides play with different networks and each side evaluates the
+// positions it will move in with its own.
+//
+// The request therefore carries the network to evaluate it with, and the
+// game loop fills it in.  It lives here rather than in the CUDA file so that
+// the portable build and the CUDA build fill it in exactly the same way.
+// ---------------------------------------------------------------------------
+
+struct Request {
+    uint32_t game;
+    uint16_t child;
+    uint16_t stm;
+    uint8_t  net_id;      // which network evaluates this position
+    uint8_t  board[63];
+};
+
 }  // namespace jungle_gpu

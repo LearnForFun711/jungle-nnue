@@ -66,6 +66,20 @@ jobs:
           . .venv/bin/activate
           ./engine/build/game_check --games 8 --time 0.05 --nnue /tmp/ci-run/net.nnue
 
+      - name: The league reports the winner, not the loser
+        run: |
+          set -e
+          . .venv/bin/activate
+          make -C engine BUILD=buildgpu buildgpu/gpu_selfplay_cpu
+          # A second network: the first one, with a little noise on it.
+          python3 scripts/net_to_checkpoint.py --net /tmp/ci-run/net.nnue \
+              --noise 0.05 --seed 3 --out /tmp/ci-run/mutant.pt
+          python3 train/export_nnue.py --checkpoint /tmp/ci-run/mutant.pt \
+              --out /tmp/ci-run/mutant.nnue
+          python3 scripts/verify_league.py \
+              --nets /tmp/ci-run/net.nnue,/tmp/ci-run/mutant.nnue \
+              --games 2 --sims 40 --out /tmp/ci-run/league
+
       - name: The GPU teacher agrees with the engine's teacher
         run: |
           set -e

@@ -53,6 +53,21 @@ distillation to be worth anything.
   game outcome.  The diagnostic that caught it was a per-ending-cause
   breakdown of the correlation, not the aggregate number.
 
+* **The match harness had the same inversion, and nobody noticed.**  The bug
+  above was in the data generator; the same mistake was made again, years of
+  work later, in `engine/tools/match.cpp` -- and it survived because a match
+  result has no internal cross-check.  The teacher's values were
+  anti-correlated with the outcome, which is obvious.  A match that says
+  "the neural engine won 202 and lost 13" looks exactly like a match in
+  which the neural engine won 202 and lost 13.
+
+  The fix and the guard are described in
+  [the match harness reported the loser](#the-match-harness-reported-the-loser)
+  below.  The short version: the game loop now lives in one place
+  (`engine/src/match_game.hpp`), and `engine/tools/game_check.cpp` plays
+  games through the same function the harness calls and compares what it
+  reports against the winner taken from the board.
+
 * **The feature transformer was indexed as a flat array.**  The weights are
   stored as `[FT_INPUT][ft_hidden]` (transposed, see below), and the accumulator
   update walked the flat array instead of the matrix row, so it added the wrong
@@ -60,6 +75,67 @@ distillation to be worth anything.
   numbers — which is why the only thing that caught it was asserting that the
   PyTorch and C++ forward passes agree.  `scripts/verify_nnue.py` exists for
   exactly this.
+
+## The match harness reported the loser
+
+Every match result this project produced before 2026-11-05 was upside down.
+
+`engine/tools/match.cpp` decided who had won a game like this:
+
+```cpp
+const bool den_entry = (terrain().den_owner[m.to] == opposite_color(pos.stm));
+make_move(pos, m);
+if (den_entry)
+    return {pos.stm == RED ? +1 : -1, pos.ply, END_DEN, pos.stm == RED ? 1 : 0};
+```
+
+`make_move()` flips the side to move, so after the move `pos.stm` is the side
+that *lost* -- the mover has just entered the opponent's den and won.  The
+harness therefore recorded the loser as the winner, and it did so for every
+game that ended the way games in this game end: by a den entry.
+
+The data generator had the identical bug once, and it was caught because a
+teacher whose values are anti-correlated with the outcome is visibly wrong.
+The match harness had no such tell.  "202 wins, 13 losses, 185 draws" is a
+perfectly plausible score for a strong engine; it just happened to be the
+score of a weak one.
+
+The fix separates the two things the old code conflated:
+
+* `GameResult::red_won` -- the truth, taken from the board.  It is 1 when the
+  side that moved into the opponent's den was Red.
+* `GameResult::result` -- the reported value, from Red's point of view, taken
+  from the side to move after the move.
+
+They are computed from different sources on purpose, so that they can be
+compared.  `engine/tools/game_check.cpp` plays games through the very same
+`play_game()` that the harness calls and checks the two against each other:
+
+```
+games                              30
+decisive                           30   (den 30, no-moves 0)
+harness agrees with the board      30
+harness disagrees with the board  0
+```
+
+Before the fix: 30 of 30 disagreed.  It is a CI step now.
+
+The game loop also moved out of the harness into `engine/src/match_game.hpp`,
+because the bug was a *drift* bug: the generator and the harness each had
+their own copy of the same rule, and the copies disagreed.  One copy cannot
+drift.
+
+What this changes is everything that was measured with the harness: the
+acceptance numbers, the Elo differences, the "the network at this scale wins
+every decisive game" note in `engine/src/nnue.hpp`, and the value scale
+tuning that went with it.  The measurements that did not go through the
+harness -- the teacher's values, the network's correlation with the game
+outcome, the parity tests -- are unaffected, because they compare the
+network and the teacher against each other rather than against a match.
+
+The general lesson: a number that comes out of a program needs a check that
+does not come from the same program.  The harness had none, and its output
+was confidently wrong for a long time.
 
 ## The training pipeline could not learn at all
 
@@ -417,6 +493,109 @@ lifts the target's correlation with the outcome from 0.362 to 0.407, so the
 work does compound; but no amount of teacher quality gets past the fact that
 the teacher is estimating a quantity the game's result already answers
 exactly.
+
+## A league needs two networks in one game
+
+The reinforcement loop keeps a population of networks and plays them against
+each other, so the generator had to learn to play a game in which the two
+sides use *different* networks.
+
+That is a small change in principle: the leaf evaluation asks the network
+for the value of a position from the point of view of the side to move, so
+the network it asks is the one the side to move plays with.  In the CUDA
+kernel that means the request carries the network to evaluate it with, and
+the kernel holds an array of networks:
+
+```cpp
+const float value = nnue_eval_batch(*nets[r.net_id], r.board, int(r.stm), ...);
+```
+
+The accumulators of the forward pass live in registers, not in the network,
+so two networks can be evaluated at the same time without a race, and the
+only thing the kernel needs is the right pointer.
+
+Two things did need care:
+
+* **The shared memory is sized for one shape.**  Every network in a league
+  has to have the same shape, because the slice the forward pass uses is
+  laid out for one network's width.  The host refuses to start a league
+  whose networks differ, rather than quietly reading past the end of the
+  slice.
+* **The game loop and the kernel must not drift apart.**  The request is
+  filled in by `Game::fill_request()`, in the portable core, and the CPU
+  reference build uses the same function.  The same mistake as the one that
+  inverted the match harness -- two copies of the same rule that disagree --
+  would have been much harder to find here, because a league that rates the
+  candidates backwards still produces a plausible-looking table.
+
+So the league has its own check, `scripts/verify_league.py`, and it does not
+use a sign convention at all: it plays a round, reads the records back, and
+works out who won from the *board* -- the last record of a game is the
+position the winner moved from, and the winner is the side that can step
+into the opponent's den.  The league's own answer and the board's answer
+have to agree on every game.
+
+### The league and the engine agree
+
+The league measures the networks as teacher leaves, which is not quite the
+same thing as the alpha-beta engine that plays them.  Measured on the two
+networks this project has, the two agree:
+
+| | old network's score |
+|---|---|
+| the alpha-beta engine, 200 games at 0.3 s/move | 0.603 (Elo +72) |
+| the league, 40 games of the MCTS teacher | 0.650 |
+
+The league is a good proxy, and it is the one that can be run by the thousand
+on a GPU.  The number that decides what ships is still the match against the
+handcrafted engine.
+
+## The population loop
+
+`scripts/rl_population.py` runs the whole thing as a loop over generations,
+and `colab/rl_population.ipynb` is the Colab version of it.
+
+One generation:
+
+1. **League.**  Every pair of candidates plays, in both colours.  The
+   candidates are rated by the games.
+2. **Data.**  The champion plays itself.  The games are the reward: every
+   position in a game carries the game's result, and the result is the only
+   ground truth there is.
+3. **Training.**  Every candidate is trained on that data.  The target is
+   the game's result with a configurable weight, the teacher's value with
+   the rest.
+4. **Mutation.**  The last member of the population is a fresh mutant of the
+   champion -- the champion's weights with a little noise on them -- so
+   something new is always in the population.
+5. **Selection.**  The league decides who the champion is.  The champion is
+   kept untouched, so a generation can never be worse than the one before it.
+
+Two things about this are worth stating plainly.
+
+**The fitness is the result of the games.**  Not a loss, not a correlation.
+The rule that shipped the wrong network was a rule about how well a
+candidate looked like the data, and it was wrong; the games are the thing
+that is actually being optimised.
+
+**The loop cannot go past the teacher on its own.**  A network distilled from
+a teacher converges to that teacher, and the teacher is a ceiling.  The
+strongest network in this project is the one that was trained when the
+teacher was weak: it had to learn the game's result on its own, and it ended
+up above the teacher it was distilled from.  So the loop's job is to keep the
+reward heavier than the teacher's value, and to select by playing strength.
+Going *past* the fixed point needs the policy -- the visit counts of the
+search, learned and used to guide the next search -- and that is a bigger
+change to the network format and to the engine than this loop makes.
+
+### A hang worth remembering
+
+The training loop checks its time budget inside the batch loop.  A dataset
+smaller than one batch produces no batches, so the check is never reached
+and the run loops forever.  The budget is now checked at the top of the
+epoch as well, and a dataset smaller than one batch still gets one batch,
+because a run that does nothing looks exactly like a run that is not
+learning.
 
 ## A network distilled from a strong teacher is the teacher
 

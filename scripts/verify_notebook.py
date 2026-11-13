@@ -51,45 +51,58 @@ def transformer():
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
-    if not os.path.exists(path):
-        raise SystemExit(f"no such notebook: {path}")
+    paths = sys.argv[1:]
+    if not paths:
+        # Every notebook in the repository: they are all interfaces the
+        # training programme runs through, and a syntax error in any of them
+        # only shows up when the user runs it.
+        colab = os.path.join(ROOT, "colab")
+        paths = sorted(os.path.join(colab, n) for n in os.listdir(colab)
+                       if n.endswith(".ipynb")) if os.path.isdir(colab) else []
+        if not paths:
+            raise SystemExit(f"no notebooks in {colab}")
 
-    with open(path) as f:
-        nb = json.load(f)
+    failed = 0
+    for path in paths:
+        if not os.path.exists(path):
+            raise SystemExit(f"no such notebook: {path}")
 
-    cells = nb.get("cells", [])
-    errors = []
-    checked = 0
-    tm = transformer()
+        with open(path) as f:
+            nb = json.load(f)
 
-    for i, cell in enumerate(cells):
-        if cell.get("cell_type") != "code":
-            continue
-        source = "".join(cell.get("source", []))
-        if not source.strip():
-            continue
-        checked += 1
-        if tm is not None:
+        cells = nb.get("cells", [])
+        errors = []
+        checked = 0
+        tm = transformer()
+
+        for i, cell in enumerate(cells):
+            if cell.get("cell_type") != "code":
+                continue
+            source = "".join(cell.get("source", []))
+            if not source.strip():
+                continue
+            checked += 1
+            if tm is not None:
+                try:
+                    tm.transform_cell(source)
+                    continue
+                except Exception as exc:
+                    errors.append((i, f"IPython transform: {exc}"))
+                    continue
             try:
-                tm.transform_cell(source)
-                continue
-            except Exception as exc:
-                errors.append((i, f"IPython transform: {exc}"))
-                continue
-        try:
-            ast.parse(strip_magics(source))
-        except SyntaxError as exc:
-            errors.append((i, f"SyntaxError: {exc}"))
+                ast.parse(strip_magics(source))
+            except SyntaxError as exc:
+                errors.append((i, f"SyntaxError: {exc}"))
 
-    print(f"checked {checked} code cells in {os.path.basename(path)}")
-    if errors:
-        for i, msg in errors:
-            print(f"  cell {i}: {msg}")
-        print(f"\nFAIL: {len(errors)} cell(s) do not parse")
-        return 1
-    print("PASS: every code cell parses")
-    return 0
+        print(f"checked {checked} code cells in {os.path.basename(path)}")
+        if errors:
+            for i, msg in errors:
+                print(f"  cell {i}: {msg}")
+            print(f"\nFAIL: {len(errors)} cell(s) do not parse")
+            failed = 1
+        else:
+            print("PASS: every code cell parses")
+    return failed
 
 
 if __name__ == "__main__":

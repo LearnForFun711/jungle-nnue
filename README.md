@@ -371,11 +371,14 @@ game to game:
 | 1 | 400 | 202 W, 13 L, 185 D | 0.736 (95% CI [0.693, 0.779]) | **+178** |
 | 3 | 200 | **170 W, 0 L, 30 D** | 0.925 (95% CI [0.889, 0.962]) | **+436** |
 
-A later network, trained on data from the GPU teacher, scored **200 W, 200 L,
-0 D** over 400 games at one second a move: score 0.500, 95% CI [0.451, 0.549],
-Elo **+0.0**.  It ties the handcrafted engine.  The reason is in
-[the rule that shipped the wrong network](#the-rule-that-shipped-the-wrong-network)
-below.
+> **These two rows were measured with a harness that reported the loser as the
+> winner.**  The bug was found in November 2026 and the numbers above are the
+> ones it produced.  A later network, measured with the fixed harness, scored
+> **200 W, 200 L, 0 D** over 400 games at one second a move: score 0.500, 95%
+> CI [0.451, 0.549], Elo **+0.0** — it ties the handcrafted engine.  The
+> harness is fixed now, `engine/tools/game_check.cpp` checks that it reports
+> the winner, and the numbers have to be measured again.  See
+> [the match harness reported the loser](docs/DESIGN.md#the-match-harness-reported-the-loser).
 
 At one second per move the neural engine wins 93.9% of the decisive games
 (95% CI [0.908, 0.971]).  At three seconds it wins *every* decisive game —
@@ -518,6 +521,76 @@ per phase.  The calibration curve is worth looking at: the shipped network
 was over-confident in the band that decides games, predicting +0.174 where
 the true outcome was +0.049, while the strong network's error in that band
 was under 0.025.
+
+---
+
+## Training by self-play, with a population
+
+`colab/rl_population.ipynb` is the other way to do it, and it is the way this
+project now goes: **a population of networks that play each other, generation
+after generation, and the one that wins is kept.**
+
+Everything that costs GPU time happens on the GPU.  The games are played by
+the MCTS teacher with **each side using its own network** as the leaf
+evaluation, so a better network shows up as a better player and not just as
+a better number.  That needed the GPU kernel to pick the network per
+request, so a league round is one launch with a schedule of network pairs:
+
+```
+games 8  positions 466  R4 B4 D0
+pair 0:1  games 4  red wins 2  black wins 2  draws 0  score(red) 0.500
+pair 1:0  games 4  red wins 2  black wins 2  draws 0  score(red) 0.500
+```
+
+One generation:
+
+1. **League** — every pair plays, in both colours.
+2. **Data** — the champion plays itself.  The games are the reward.
+3. **Training** — every candidate is trained on that data, with the game's
+   result as the target and the teacher's value as a smaller signal.
+4. **Mutation** — the next candidates are the champion with a little noise on
+   the weights, and a slightly different recipe each.
+5. **Selection** — the league decides who the champion is.
+
+The champion is never thrown away, so a generation can never be worse than
+the one before it.
+
+```bash
+python3 scripts/rl_population.py --champion net/net.nnue --out runs/rl \
+    --generations 8 --population 4
+```
+
+It runs on the CPU as well — the portable core has the same league, one game
+at a time — so the loop can be tested without a GPU, and the CUDA build has
+to agree with it.
+
+The league is a good proxy for the engine, and it was checked against it.
+Two networks, the older and the newer, measured two ways:
+
+| | the older network's score |
+|---|---|
+| the alpha-beta engine, 200 games at 0.3 s/move | 0.603 (Elo **+72**) |
+| the league, 40 games of the MCTS teacher | 0.650 |
+
+`scripts/verify_league.py` checks the league against the board itself, so a
+league that rated the candidates backwards could not pass.
+
+### What this can and cannot do
+
+A network distilled from a teacher cannot be better than that teacher: it
+converges to it.  The strongest network in this project is the one that was
+trained when the teacher was *weak* — it had to learn the game's result on
+its own, and it ended up well above the teacher it was distilled from
+(+0.384 against the outcome, where the teacher was at +0.150).  A strong
+teacher closes that gap, and the student stops learning.
+
+So the loop's job is to keep the reward (the game's result) heavier than the
+teacher's value, and to select by playing strength rather than by looking
+like the data.  What it cannot do is go past the teacher on its own: a
+value-only loop converges to the fixed point of the search.  Going past it
+needs the *policy* — the visit counts of the search, learned and used to
+guide the next search — which is a bigger change to the network format and
+to the engine than this notebook makes.
 
 ---
 
